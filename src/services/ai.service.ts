@@ -21,10 +21,12 @@ import {
   yesterdayBounds,
 } from "./sapSales.service";
 import type { CurrencyTotal, QuantityTotal, SalesPeriodName, SalesPeriodResult, UniqueSalesOrder } from "./sapSales.service";
-import { getBom, getFabric, getMaterialsByPeriod, getMaterialsByProduct, getProcurement, getSalesCreated, getTrims, moduleFailure } from "./sapModules.service";
+import { getBom, getMaterialsByPeriod, getMaterialsByProduct, getProcurement, getSalesCreated, moduleFailure } from "./sapModules.service";
 import type { ModuleReport } from "./sapModules.service";
+import { getUtilizationReport, getUtilizationSummary, type UtilizationKind } from "./utilization.service";
 import { annotateAudit, obs, writeAudit } from "./audit.service";
 import { planQuestion } from "./salesLlmPlanner.service";
+import { answerSalesAssistant, isSalesHelp, salesHelpReply } from "./salesAssistant.service";
 import {
   buildPlannerContext,
   executePlan,
@@ -82,13 +84,54 @@ function requestedMode(message: string): AssistantViewMode {
   return "report";
 }
 
-function replyFromReport(message: string, report: ModuleReport, mode: AssistantViewMode): AssistantReply {
-  if (report.rows.length === 0) return { message: report.text || message };
+function replyFromReport(message: string, report: ModuleReport, mode: AssistantViewMode, suggestions: ReplySuggestion[] = HELP_SUGGESTIONS): AssistantReply {
+  if (report.rows.length === 0) return { message: report.text || message, suggestions };
+  const viewMode = report.dashboard && mode === "report" ? "dashboard" : mode;
   return {
     message: report.text,
-    view: { mode, title: report.title, kpis: report.kpis, columns: report.columns, rows: report.rows },
-    suggestions: HELP_SUGGESTIONS,
+    view: {
+      mode: viewMode,
+      title: report.title,
+      kpis: report.kpis,
+      columns: report.columns,
+      rows: report.rows,
+      ...(report.footer ? { footer: report.footer } : {}),
+      ...(report.charts?.length ? { charts: report.charts } : {}),
+      ...(report.note ? { note: report.note } : {}),
+      ...(report.source ? { source: report.source } : {}),
+      ...(report.utilization ? { utilization: report.utilization } : {}),
+      updatedAt: new Date().toISOString(),
+    },
+    suggestions,
   };
+}
+
+function utilizationSuggestions(kind: UtilizationKind, order: string | null): ReplySuggestion[] {
+  const other: UtilizationKind = kind === "fabric" ? "trims" : "fabric";
+  const otherName = other === "fabric" ? "Fabric" : "Trims";
+  const name = kind === "fabric" ? "Fabric" : "Trims";
+  if (order) {
+    return [
+      { label: `${otherName} for ${order}`, question: `Show ${other} utilization for ${order}` },
+      { label: `BOM for ${order}`, question: `Show BOM components for ${order}` },
+      { label: `${name} dashboard`, question: `${name} dashboard this month` },
+    ];
+  }
+  return [
+    { label: `${name} last month`, question: `${name} dashboard last month` },
+    { label: `${otherName} dashboard`, question: `${otherName} dashboard this month` },
+    { label: "Sales order 4203", question: `Show ${kind} utilization for 4203` },
+  ];
+}
+
+async function answerUtilization(kind: UtilizationKind, message: string, order: string | null, mode: AssistantViewMode): Promise<AssistantReply> {
+  const text = message.toLowerCase();
+  if (order) return replyFromReport(message, await getUtilizationReport(kind, order), mode, utilizationSuggestions(kind, order));
+  if (/\bfor a sales order\b|\bsales order number\b/.test(text) && !/\b(dashboard|summary|overview|total)\b/.test(text)) {
+    return needOrderReply(`${kind} utilization`, utilizationSuggestions(kind, null));
+  }
+  const period = periodFromText(text) ?? "THIS_MONTH";
+  return replyFromReport(message, await getUtilizationSummary(kind, period), mode, utilizationSuggestions(kind, null));
 }
 
 function textReply(message: string, suggestions?: ReplySuggestion[]): AssistantReply {
@@ -110,18 +153,16 @@ const NEED_ORDER: ReplySuggestion[] = [
 ];
 
 function isHelpMessage(message: string): boolean {
-  return /^(hi|hai|hello|hey|who are you|what can you do|help)\b/i.test(message.trim());
+  return /^(hi|hai|hello|hey|vanakkam|who are you|what can you do|help)\b/i.test(message.trim()) || isSalesHelp(message);
 }
 
-function helpReply(): AssistantReply {
-  return textReply(
-    "I answer from live SAP across Sales, Quotations, Materials, Procurement, BOM, Trims, and Fabric. Ask for a period, a product code, or a sales document number.",
-    HELP_SUGGESTIONS,
-  );
+function helpReply(message: string): AssistantReply {
+  const sales = salesHelpReply(message);
+  return textReply(`${sales.message}\n\nI can also answer from Quotations, Materials, Procurement, BOM, Trims and Fabric.`, sales.suggestions ?? HELP_SUGGESTIONS);
 }
 
-function needOrderReply(kind: string): AssistantReply {
-  return textReply(`Tell me the sales order number for ${kind}.`, NEED_ORDER);
+function needOrderReply(kind: string, suggestions: ReplySuggestion[] = NEED_ORDER): AssistantReply {
+  return textReply(`Tell me the sales order number for ${kind}.`, suggestions);
 }
 
 const TOOL_DEFINITIONS = [
@@ -729,8 +770,7 @@ async function answerSapModule(message: string, history: ChatTurn[] = []): Promi
     if (pendingModule && order && !/\b(quotation|material|procurement|bom|coois|trim|fabric)\b/.test(text)) {
       if (pendingModule === "procurement") return replyFromReport(message, await getProcurement(order), mode);
       if (pendingModule === "bom") return replyFromReport(message, await getBom(order), mode);
-      if (pendingModule === "trims") return replyFromReport(message, await getTrims(order), mode);
-      return replyFromReport(message, await getFabric(order), mode);
+      return answerUtilization(pendingModule, message, order, mode);
     }
     if (/\bquotations?\b/.test(text)) {
       const data = await getSalesOrdersByDateRange(period);
@@ -741,13 +781,11 @@ async function answerSapModule(message: string, history: ChatTurn[] = []): Promi
         suggestions: HELP_SUGGESTIONS,
       };
     }
-    if (/\b(trim|trims)\b/.test(text)) {
-      if (!order) return needOrderReply("trims utilization");
-      return replyFromReport(message, await getTrims(order), mode);
-    }
-    if (/\bfabric\b/.test(text)) {
-      if (!order) return needOrderReply("fabric utilization");
-      return replyFromReport(message, await getFabric(order), mode);
+    const trimsAt = text.search(/\btrims?\b/);
+    const fabricAt = text.search(/\bfabrics?\b/);
+    if (trimsAt >= 0 || fabricAt >= 0) {
+      const kind: UtilizationKind = fabricAt >= 0 && (trimsAt < 0 || fabricAt < trimsAt) ? "fabric" : "trims";
+      return answerUtilization(kind, message, order, mode);
     }
     if (/\b(bom|coois|component)\b/.test(text)) {
       if (!order) return needOrderReply("the BOM");
@@ -842,7 +880,7 @@ async function generateDemoReply(message: string, history: ChatTurn[] = []): Pro
   const moduleReply = await answerSapModule(message, history);
   if (moduleReply) return moduleReply;
 
-  const salesReply = await answerSales(message, history);
+  const salesReply = await answerSalesAssistant(message, history);
   if (salesReply) return salesReply;
 
   const tools = identifyBusinessTools(message);
@@ -850,7 +888,7 @@ async function generateDemoReply(message: string, history: ChatTurn[] = []): Pro
 
   if (tools.length === 0) {
     if (isHelpMessage(message)) {
-      return helpReply();
+      return helpReply(message);
     }
 
     return textReply(
@@ -959,7 +997,7 @@ async function generateLiveReply(message: string, history: ChatTurn[]): Promise<
 
 export async function generateReply(message: string, history: ChatTurn[]): Promise<AssistantReply> {
   if (isHelpMessage(message)) {
-    return helpReply();
+    return helpReply(message);
   }
 
   if (!isLiveAiConfigured()) {
@@ -971,7 +1009,7 @@ export async function generateReply(message: string, history: ChatTurn[]): Promi
   }
   const moduleReply = await answerSapModule(message, history);
   if (moduleReply) return moduleReply;
-  const salesReply = await answerSales(message, history);
+  const salesReply = await answerSalesAssistant(message, history);
   if (salesReply) return salesReply;
 
   try {

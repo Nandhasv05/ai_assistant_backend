@@ -79,9 +79,62 @@ export interface QueryPlan {
 
 export interface ChartSpec {
   title: string;
-  kind: "bar" | "line";
+  kind: "bar" | "line" | "donut";
   labels: string[];
   series: Array<{ name: string; values: number[]; color?: string }>;
+  /** One colour per label: bar charts colour each bar, donuts colour each slice. */
+  colors?: string[];
+}
+
+export interface UtilizationTotals {
+  orders: number;
+  materials: number;
+  lines: number;
+  bom: number;
+  planned: number;
+  production: number;
+  po: number;
+  grn: number;
+  issue: number;
+}
+
+export interface UtilizationLine {
+  salesOrder: string;
+  material: string;
+  category: string;
+  purchaseOrder: string;
+  poLine: string;
+  bom: number;
+  planned: number;
+  production: number;
+  po: number;
+  grn: number;
+  issue: number;
+  additionalOrders: string[];
+}
+
+export interface UtilizationOrder {
+  salesOrder: string;
+  materials: number;
+  lines: number;
+  bom: number;
+  planned: number;
+  production: number;
+  po: number;
+  grn: number;
+  issue: number;
+}
+
+/** Fabric / Trims utilization payload rendered by the dedicated report layout. */
+export interface UtilizationPayload {
+  kind: "fabric" | "trims";
+  scope: "order" | "summary";
+  salesOrder?: string;
+  period?: string;
+  totals: UtilizationTotals;
+  lines?: UtilizationLine[];
+  orders?: UtilizationOrder[];
+  mix?: { title: string; labels: string[]; values: number[] };
 }
 
 export interface ViewSection {
@@ -104,7 +157,9 @@ export interface StructuredView {
   kpis: Array<{ label: string; value: string }>;
   columns: string[];
   rows: string[][];
+  footer?: string[];
   charts?: ChartSpec[];
+  utilization?: UtilizationPayload;
   sections?: ViewSection[];
   bullets?: string[];
   source?: string;

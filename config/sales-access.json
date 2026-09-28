@@ -1,0 +1,9 @@
+{
+  "defaultRole": "sales_user",
+  "defaultPlants": ["*"],
+  "portalRoles": {
+    "admin": { "role": "admin" }
+  },
+  "departments": {},
+  "users": {}
+}

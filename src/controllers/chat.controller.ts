@@ -2,6 +2,7 @@ import type { Request, Response } from "express";
 import { generateReply } from "../services/ai.service";
 import type { ChatTurn } from "../services/ai.service";
 import { runWithAudit, writeAudit } from "../services/audit.service";
+import { accessFromToken, runWithSalesAccess } from "../services/salesAccess.service";
 import { buildExportDocument, exportFileName, getExport, registerExport, renderExport, type ExportFormat } from "../services/salesExport.service";
 
 const MAX_MESSAGE_LENGTH = 4000;
@@ -75,7 +76,8 @@ export async function postChat(req: Request, res: Response): Promise<void> {
 
   console.log(`[chat] message received (${message.length} chars, history ${history.length})`);
 
-  await runWithAudit(readSessionId(req, body), message, async () => {
+  const access = accessFromToken(req.header("x-evolv-context"));
+  await runWithSalesAccess(access, () => runWithAudit(readSessionId(req, body), message, async () => {
     try {
       const reply = await generateReply(message, history);
       let view = reply.view ?? null;
@@ -92,7 +94,7 @@ export async function postChat(req: Request, res: Response): Promise<void> {
         message: "The assistant could not complete this request. Please try again.",
       });
     }
-  });
+  }));
 }
 
 const FORMATS: ExportFormat[] = ["pdf", "xlsx", "csv"];

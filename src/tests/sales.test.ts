@@ -35,6 +35,9 @@ import {
   type QueryPlan,
 } from "../services/salesPlanner.service";
 import { businessToday, clearSapCache, fetchSalesItems, getDateRange, SapError, setSapFetch, type SalesItemRecord } from "../services/sapSales.service";
+import { resolveSalesAccess, runWithSalesAccess, signSalesToken, verifySalesToken, type SalesAccess } from "../services/salesAccess.service";
+import { answerSalesAssistant, salesHelpReply } from "../services/salesAssistant.service";
+import { runSalesTool } from "../services/salesAssistantTools.service";
 
 let passed = 0;
 let failed = 0;
@@ -332,6 +335,78 @@ async function main(): Promise<void> {
   });
   const rejected = await ask("delete all sales orders from table");
   ok("write request refused (read-only)", /read-only/.test(rejected?.message ?? ""), rejected?.message);
+
+  console.log("Sales Assistant v2: access, tools, rules");
+  const secret = "unit-test-secret-0123456789";
+  const token = signSalesToken({ u: "Ravi", r: "user", d: "Sales" }, secret, fixedNow.getTime());
+  ok("token verifies", verifySalesToken(token, secret, fixedNow.getTime())?.username === "Ravi");
+  ok("tampered token rejected", verifySalesToken(`${token.slice(0, -2)}xx`, secret, fixedNow.getTime()) === null);
+  ok("wrong secret rejected", verifySalesToken(token, "another-secret-0123456789", fixedNow.getTime()) === null);
+  ok("expired token rejected", verifySalesToken(token, secret, fixedNow.getTime() + 9 * 3600 * 1000) === null);
+  ok("unmapped user → sales_user, all plants", (() => {
+    const access = resolveSalesAccess({ username: "nobody-here", role: "user" });
+    return access.role === "sales_user" && access.plants.includes("*");
+  })());
+  ok("portal admin → admin", resolveSalesAccess({ username: "x", role: "admin" }).role === "admin");
+
+  const salesUser: SalesAccess = { role: "sales_user", plants: ["P002"], username: "t", source: "token" };
+  const manager: SalesAccess = { role: "manager", plants: ["*"], username: "m", source: "token" };
+  const v2Rows = [
+    sapRow("4645", "10", { Plant: "P002", TransactionCurrency: "EUR", SalesOrderItemCategory: "ZTAN", NetAmount: "100.00", CostAmount: "40.00", TaxAmount: "5.00" }),
+    sapRow("4645", "20", { Plant: "P002", TransactionCurrency: "EUR", SalesOrderItemCategory: "ZFOC", NetAmount: "7.00", TaxAmount: "1.00", CostAmount: "3.00" }),
+    sapRow("4645", "30", { Plant: "P002", TransactionCurrency: "EUR", SalesOrderItemCategory: "TAG", SalesOrderItemType: "B", NetAmount: "0.00", OrderQuantity: "99" }),
+    sapRow("5000", "10", { Plant: "P003", TransactionCurrency: "INR", SalesOrderItemCategory: "ZTAN", NetAmount: "900.00" }),
+    sapRow("6000", "10", { Plant: "P002", TransactionCurrency: "USD", SalesOrderItemCategory: "ZFOC", NetAmount: "0.00" }),
+  ];
+  setSapFetch(async (url) => {
+    const order = /SalesOrder eq '(\w+)'/.exec(decodeURIComponent(String(url)))?.[1];
+    return json({ d: { results: order ? v2Rows.filter((row) => row.SalesOrder === order) : v2Rows } });
+  });
+  const v2Range = { date_from: "2026-09-01", date_to: "2026-09-25" };
+
+  const managerSummary = (await runWithSalesAccess(manager, () => runSalesTool("get_sales_summary", v2Range, fixedNow))) as Record<string, any>;
+  ok("summary excludes TAG + FOC from items", managerSummary.item_count === 2, String(managerSummary.item_count));
+  ok("summary counts FOC-only orders", managerSummary.foc_only_order_count === 1, String(managerSummary.foc_only_order_count));
+  ok("summary has envelope", typeof managerSummary.data_as_of === "string" && Array.isArray(managerSummary.warnings) && managerSummary.row_count === 5);
+  ok("manager sees cost", managerSummary.by_currency.some((row: any) => row.cost_amount === 40));
+  ok("FOC value/tax reported separately", managerSummary.foc.by_currency.some((row: any) => row.foc_value === 7 && row.foc_tax === 1));
+
+  const userSummary = (await runWithSalesAccess(salesUser, () => runSalesTool("get_sales_summary", v2Range, fixedNow))) as Record<string, any>;
+  ok("sales_user: other plant hidden", userSummary.item_count === 1 && !userSummary.by_currency.some((row: any) => row.currency === "INR"), JSON.stringify(userSummary.by_currency));
+  ok("sales_user: cost stripped", !/"(cost_amount|margin|cost)":/.test(JSON.stringify(userSummary)));
+  let plantError = "";
+  await runWithSalesAccess(salesUser, () => runSalesTool("get_sales_summary", { ...v2Range, filters: { plant: "P003" } }, fixedNow)).catch((error: Error) => (plantError = error.message));
+  ok("sales_user: other plant filter refused", /No access to plant P003/.test(plantError), plantError);
+  let costError = "";
+  await runWithSalesAccess(salesUser, () => runSalesTool("top_n", { ...v2Range, metric: "cost_amount", dimension: "material" }, fixedNow)).catch((error: Error) => (costError = error.message));
+  ok("sales_user: cost ranking refused", /not available/.test(costError), costError);
+  let rangeError = "";
+  await runSalesTool("get_sales_summary", { date_from: "2026-07-01", date_to: "2026-09-25" }, fixedNow).catch((error: Error) => (rangeError = error.message));
+  ok("range over 31 days refused", /31 days/.test(rangeError), rangeError);
+  const compared = (await runWithSalesAccess(manager, () => runSalesTool("compare_periods", { period_a: v2Range, period_b: { date_from: "2026-08-01", date_to: "2026-08-25" } }, fixedNow))) as Record<string, any>;
+  ok("compare_periods returns differences", typeof compared.totals?.item_count?.difference === "number" && Array.isArray(compared.by_currency));
+  const search = (await runWithSalesAccess(manager, () => runSalesTool("search_material", { text: "mat-a" }, fixedNow))) as Record<string, any>;
+  ok("search_material finds partial code", search.total_matches >= 1 && search.matches[0].material === "MAT-A");
+
+  const orderOther = await runWithSalesAccess(salesUser, () => runSalesTool("get_order_details", { sales_order: "5000" }, fixedNow).catch(() => null));
+  ok("sales_user: order of other plant not revealed", (orderOther as { found?: boolean } | null)?.found === false);
+
+  const rules = (question: string, history: Array<{ role: "user" | "assistant"; content: string }> = [], access: SalesAccess = manager) =>
+    runWithSalesAccess(access, () => answerSalesAssistant(question, history, fixedNow));
+  const costReply = await rules("sales margin this month", [], salesUser);
+  ok("rules: cost/margin refused for sales_user", /ungalukku available illa|not available for your role/.test(costReply?.message ?? ""), costReply?.message);
+  const yesNo = await rules("4645 delivered ah?");
+  ok("rules: yes/no answer starts with Illa", /^Illa, order `4645`/.test(yesNo?.message ?? ""), yesNo?.message);
+  const refined = await rules("adhula INR mattum", [{ role: "user", content: "this month evlo sales?" }, { role: "assistant", content: "…" }]);
+  ok("rules: filter carry-over keeps date", /^Same date, INR only:/.test(refined?.message ?? "") && /This month/.test(refined?.message ?? "") && /INR/.test(refined?.message ?? ""), refined?.message);
+  const basis = await rules("sales this month");
+  ok("rules: based-on + data-as-of line", /Based on items created from 01-Sep-2026 to 25-Sep-2026\. Data as of /.test(basis?.message ?? ""), basis?.message);
+  const bigRange = await rules("sales in 2026");
+  ok("rules: big range asks to narrow", /31 days/.test(bigRange?.message ?? ""), bigRange?.message);
+  const help = salesHelpReply("enna panna mudiyum");
+  ok("help: Tanglish intro + 5 examples", /Evolv Sales Assistant/.test(help.message) && (help.suggestions?.length ?? 0) === 5);
+  const forecast = await rules("next week sales increase aagumaa?");
+  ok("rules: forecast declined", /Forecast panna ennala mudiyadhu/.test(forecast?.message ?? ""), forecast?.message);
   setSapFetch();
 
   console.log(`\n${passed} passed, ${failed} failed`);

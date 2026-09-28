@@ -50,8 +50,12 @@ app.use((error: unknown, _req: Request, res: Response, next: NextFunction) => {
   next(error);
 });
 
-const frontendDir = path.resolve(__dirname, "../../frontend/dist");
-if (existsSync(frontendDir)) {
+const frontendCandidates = [
+  path.resolve(__dirname, "../../public"),
+  path.resolve(__dirname, "../../frontend/dist"),
+];
+const frontendDir = frontendCandidates.find((dir) => existsSync(path.join(dir, "index.html")));
+if (frontendDir) {
   app.use(express.static(frontendDir));
   app.get(/^(?!\/api\/).*/, (_req, res) => {
     res.sendFile(path.join(frontendDir, "index.html"));

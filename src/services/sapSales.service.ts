@@ -1,4 +1,5 @@
 import { currentAudit, obs } from "./audit.service";
+import { restrictToAllowedPlants } from "./salesAccess.service";
 
 const DEFAULT_SAP_SALES_URL =
   "http://app-prod.evolvclothing.com:8000/sap/opu/odata/sap/ZI_SALESAPI_HUB_CDS/ZI_SalesApi_HUB";
@@ -23,6 +24,27 @@ export interface SalesItemRecord {
   CustomerGroup: string;
   DeliveryStatus: string;
   BillingStatus: string;
+  ItemCategory?: string;
+  ItemType?: string;
+  MaterialGroup?: string;
+  ShippingPoint?: string;
+  Route?: string;
+  BaseUnit?: string;
+  ConfirmedQuantity?: number;
+  NetPriceAmount?: number;
+  TaxAmount?: number;
+  CostAmount?: number;
+  BillingDocumentDate?: Date | null;
+  SDProcessStatus?: string;
+  DeliveryConfirmationStatus?: string;
+  DeliveryBlockStatus?: string;
+  BillingBlockStatus?: string;
+  ItemIsBillingRelevant?: string;
+  GeneralIncompletionStatus?: string;
+  BillingIncompletionStatus?: string;
+  PricingIncompletionStatus?: string;
+  DeliveryIncompletionStatus?: string;
+  RejectionStatus?: string;
 }
 
 export interface CurrencyTotal {
@@ -234,6 +256,27 @@ function toItem(row: Record<string, unknown>): SalesItemRecord {
     CustomerGroup: textField(row, "CustomerGroup"),
     DeliveryStatus: textField(row, "DeliveryStatus") || textField(row, "TotalDeliveryStatus"),
     BillingStatus: textField(row, "BillingStatus") || textField(row, "OrderRelatedBillingStatus"),
+    ItemCategory: textField(row, "SalesOrderItemCategory"),
+    ItemType: textField(row, "SalesOrderItemType"),
+    MaterialGroup: textField(row, "MaterialGroup"),
+    ShippingPoint: textField(row, "ShippingPoint"),
+    Route: textField(row, "Route"),
+    BaseUnit: textField(row, "BaseUnit") || textField(row, "OrderQuantityUnit") || "EA",
+    ConfirmedQuantity: numberField(row, "ConfdDeliveryQtyInBaseUnit"),
+    NetPriceAmount: numberField(row, "NetPriceAmount"),
+    TaxAmount: numberField(row, "TaxAmount"),
+    CostAmount: numberField(row, "CostAmount"),
+    BillingDocumentDate: parseSapDate(textField(row, "BillingDocumentDate") || null),
+    SDProcessStatus: textField(row, "SDProcessStatus"),
+    DeliveryConfirmationStatus: textField(row, "DeliveryConfirmationStatus"),
+    DeliveryBlockStatus: textField(row, "DeliveryBlockStatus"),
+    BillingBlockStatus: textField(row, "BillingBlockStatus"),
+    ItemIsBillingRelevant: textField(row, "ItemIsBillingRelevant"),
+    GeneralIncompletionStatus: textField(row, "ItemGeneralIncompletionStatus"),
+    BillingIncompletionStatus: textField(row, "ItemBillingIncompletionStatus"),
+    PricingIncompletionStatus: textField(row, "PricingIncompletionStatus"),
+    DeliveryIncompletionStatus: textField(row, "ItemDeliveryIncompletionStatus"),
+    RejectionStatus: textField(row, "SDDocumentRejectionStatus"),
   };
 }
 
@@ -558,12 +601,13 @@ export async function fetchSalesItems(filter: string): Promise<SalesFetchResult>
     obs("SAP_CACHE_HIT", { endpoint: "ZI_SalesApi_HUB", filter });
     const value = await hit.value;
     currentAudit()?.sapCalls.push({ endpoint: "ZI_SalesApi_HUB", filter, status: "cache", rows: value.records.length, pages: 0, attempts: 0, ms: 0 });
-    return { ...value, fromCache: true };
+    return { ...value, records: restrictToAllowedPlants(value.records), fromCache: true };
   }
   const value = loadSalesItems(filter);
   if (ttl > 0) cache.set(filter, { expires: now + ttl, value });
   try {
-    return await value;
+    const result = await value;
+    return { ...result, records: restrictToAllowedPlants(result.records) };
   } catch (error) {
     cache.delete(filter);
     throw error;

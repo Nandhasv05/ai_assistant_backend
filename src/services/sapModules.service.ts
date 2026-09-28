@@ -1,7 +1,8 @@
+import type { ChartSpec, UtilizationPayload } from "./salesPlanner.service";
 import { getDateRange, getSalesOrdersByDate, parseSapDate, shiftDate, type SalesPeriodName, type SalesPeriodResult } from "./sapSales.service";
 
 const SAP_FAILURE = "Unable to retrieve the latest data from SAP.";
-const SAP_EMPTY = "No records were found for that request.";
+const SAP_EMPTY = "No records were found for that request.";  
 
 const ENDPOINTS = {
   material: "http://app-prod.evolvclothing.com:8000/sap/opu/odata/sap/ZI_MATERIALAPI_HUB_CDS/ZI_MaterialAPI_HUB",
@@ -35,7 +36,11 @@ function readRows(payload: unknown): Array<Record<string, unknown>> {
   return [data as Record<string, unknown>];
 }
 
-async function fetchOData(endpoint: string, filter: string, top = 200): Promise<Array<Record<string, unknown>>> {
+export function moduleEndpoint(kind: keyof typeof ENDPOINTS): string {
+  return ENDPOINTS[kind];
+}
+
+export async function fetchOData(endpoint: string, filter: string, top = 200): Promise<Array<Record<string, unknown>>> {
   const headers = { Authorization: authHeader(), Accept: "application/json" };
   let url: string | null = `${endpoint}?$filter=${encodeURIComponent(filter)}&$top=${top}&$format=json`;
   const rows: Array<Record<string, unknown>> = [];
@@ -96,6 +101,12 @@ export interface ModuleReport {
   kpis: Array<{ label: string; value: string }>;
   columns: string[];
   rows: string[][];
+  charts?: ChartSpec[];
+  footer?: string[];
+  note?: string;
+  source?: string;
+  dashboard?: boolean;
+  utilization?: UtilizationPayload;
 }
 
 function columnsFor(rows: Array<Record<string, unknown>>, fields: string[]): string[] {
@@ -179,32 +190,6 @@ export async function getBom(salesOrder: string): Promise<ModuleReport> {
     "Component",
     "Plant",
     "OrderQuantity",
-  ]);
-}
-
-export async function getTrims(salesOrder: string): Promise<ModuleReport> {
-  const rows = await fetchEither(ENDPOINTS.trims, "SalesOrder", salesOrder);
-  return toReport(`Trims utilization for sales order ${salesOrder.replace(/^0+/, "")}`, rows, [
-    "SalesOrder",
-    "Material",
-    "MaterialDescription",
-    "RequirementQuantity",
-    "IssuedQuantity",
-    "BalanceQuantity",
-    "Unit",
-  ]);
-}
-
-export async function getFabric(salesOrder: string): Promise<ModuleReport> {
-  const rows = await fetchEither(ENDPOINTS.fabric, "SalesOrder", salesOrder);
-  return toReport(`Fabric utilization for sales order ${salesOrder.replace(/^0+/, "")}`, rows, [
-    "SalesOrder",
-    "Material",
-    "MaterialDescription",
-    "RequirementQuantity",
-    "IssuedQuantity",
-    "BalanceQuantity",
-    "Unit",
   ]);
 }
 
