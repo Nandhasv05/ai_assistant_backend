@@ -124,12 +124,16 @@ function kpisFor(items: SalesItemRecord[], scope: "period" | "order"): Array<{ l
   const delivered = regular.filter((item) => item.DeliveryStatus === "C").length;
   const partial = regular.filter((item) => item.DeliveryStatus === "B").length;
   const pending = regular.filter((item) => item.DeliveryStatus === "A").length;
+  const confirmed = regular.reduce((sum, item) => sum + (item.ConfirmedOrderQuantity ?? 0), 0);
+  const returns = regular.filter((item) => item.IsReturnsItem);
   return [
     ...(scope === "period" ? [{ label: "Sales orders", value: orders.toLocaleString("en-US") }] : []),
-    { label: "Sales items", value: regular.length.toLocaleString("en-US") },
+    { label: "Items", value: regular.length.toLocaleString("en-US") },
     { label: "Quantity", value: `${qty(regular.reduce((sum, item) => sum + item.OrderQuantity, 0))} EA` },
     { label: scope === "order" ? "Order value" : "Net sales", value: moneyList(totals, (row) => row.net) },
     { label: "Tax", value: moneyList(totals, (row) => row.tax) },
+    ...(confirmed > 0 ? [{ label: "Confirmed delivery qty", value: `${qty(confirmed)} EA` }] : []),
+    ...(returns.length ? [{ label: "Return items", value: `${returns.length.toLocaleString("en-US")} (${qty(returns.reduce((sum, item) => sum + item.OrderQuantity, 0))} EA)` }] : []),
     { label: "FOC items", value: `${foc.length.toLocaleString("en-US")} (${qty(foc.reduce((sum, item) => sum + item.OrderQuantity, 0))} EA)` },
     { label: "Delivered items", value: delivered.toLocaleString("en-US") },
     { label: "Partially delivered", value: partial.toLocaleString("en-US") },
@@ -216,7 +220,15 @@ export async function periodView(mode: SalesViewMode, period: ViewPeriod, filter
   if (mode === "dashboard") {
     const days = Math.round((Date.parse(period.to) - Date.parse(period.from)) / 86_400_000) + 1;
     const trend: ChartSpec =
-      days > 1
+      days > 62
+        ? bar(
+            "Quantity by month",
+            sumBy(regular, (item) => isoInZone(item.CreationDate).slice(0, 7), (item) => item.OrderQuantity)
+              .sort(([a], [b]) => a.localeCompare(b))
+              .map(([month, value]) => [displayDate(`${month}-01`).slice(3), value] as [string, number]),
+            "Quantity",
+          )
+        : days > 1
         ? (() => {
             const perDay = new Map(sumBy(regular, (item) => isoInZone(item.CreationDate), (item) => item.OrderQuantity));
             const labels: string[] = [];
@@ -420,7 +432,7 @@ export async function compareOrdersView(first: string, second: string, mode: Sal
     ["Created on", a.created ? displayDate(a.created) : "—", b.created ? displayDate(b.created) : "—", ""],
     ["Plant", a.plants.join(", ") || "—", b.plants.join(", ") || "—", ""],
     ["Currency", a.totals.map((row) => row.currency).join(", ") || "—", b.totals.map((row) => row.currency).join(", ") || "—", ""],
-    ["Sales items", String(a.regular.length), String(b.regular.length), diffText(a.regular.length, b.regular.length)],
+    ["Items", String(a.regular.length), String(b.regular.length), diffText(a.regular.length, b.regular.length)],
     ["FOC items", String(a.foc.length), String(b.foc.length), diffText(a.foc.length, b.foc.length)],
     ["Quantity (EA)", qty(sumQty(a.regular)), qty(sumQty(b.regular)), diffText(sumQty(a.regular), sumQty(b.regular))],
   ];

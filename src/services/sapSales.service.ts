@@ -22,6 +22,9 @@ export interface SalesItemRecord {
   TransactionCurrency: string;
   Plant: string;
   CustomerGroup: string;
+  Division?: string;
+  SalesDistrict?: string;
+  IsReturnsItem?: boolean;
   DeliveryStatus: string;
   BillingStatus: string;
   ItemCategory?: string;
@@ -31,6 +34,8 @@ export interface SalesItemRecord {
   Route?: string;
   BaseUnit?: string;
   ConfirmedQuantity?: number;
+  /** ConfdDelivQtyInOrderQtyUnit: comparable with OrderQuantity (same unit). */
+  ConfirmedOrderQuantity?: number;
   NetPriceAmount?: number;
   TaxAmount?: number;
   CostAmount?: number;
@@ -254,6 +259,9 @@ function toItem(row: Record<string, unknown>): SalesItemRecord {
     TransactionCurrency: textField(row, "TransactionCurrency") || "UNKNOWN",
     Plant: textField(row, "Plant"),
     CustomerGroup: textField(row, "CustomerGroup"),
+    Division: textField(row, "Division"),
+    SalesDistrict: textField(row, "SalesDistrict"),
+    IsReturnsItem: /^(true|x)$/i.test(textField(row, "IsReturnsItem").trim()),
     DeliveryStatus: textField(row, "DeliveryStatus") || textField(row, "TotalDeliveryStatus"),
     BillingStatus: textField(row, "BillingStatus") || textField(row, "OrderRelatedBillingStatus"),
     ItemCategory: textField(row, "SalesOrderItemCategory"),
@@ -263,6 +271,7 @@ function toItem(row: Record<string, unknown>): SalesItemRecord {
     Route: textField(row, "Route"),
     BaseUnit: textField(row, "BaseUnit") || textField(row, "OrderQuantityUnit") || "EA",
     ConfirmedQuantity: numberField(row, "ConfdDeliveryQtyInBaseUnit"),
+    ConfirmedOrderQuantity: numberField(row, "ConfdDelivQtyInOrderQtyUnit"),
     NetPriceAmount: numberField(row, "NetPriceAmount"),
     TaxAmount: numberField(row, "TaxAmount"),
     CostAmount: numberField(row, "CostAmount"),
@@ -593,8 +602,8 @@ export function sapStatus(): { configured: boolean; lastOkAt: string | null } {
  * Cached, validated, normalized fetch of Sales item records for an OData filter.
  * Identical filters within SAP_CACHE_TTL_MS reuse one SAP round trip (in-flight requests are shared too).
  */
-export async function fetchSalesItems(filter: string): Promise<SalesFetchResult> {
-  const ttl = numberEnv("SAP_CACHE_TTL_MS", 120000);
+export async function fetchSalesItems(filter: string, ttlMs?: number): Promise<SalesFetchResult> {
+  const ttl = ttlMs ?? numberEnv("SAP_CACHE_TTL_MS", 120000);
   const now = Date.now();
   const hit = cache.get(filter);
   if (hit && hit.expires > now) {

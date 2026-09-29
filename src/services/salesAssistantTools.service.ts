@@ -1,5 +1,5 @@
 /*
- * Read-only Sales tools for the Evolv Sales Assistant (prompt v2.0).
+ * Read-only Sales tools for the Evolv Sales Assistant (prompt v3.0).
  * Business rules live here so every answer (LLM or rule fallback) gets the same numbers:
  * TAG rows never count, FOC is reported separately, amounts are never added across currencies,
  * cost/margin only for roles that may see it, and only the user's allowed plants are visible.
@@ -7,7 +7,21 @@
 import { allowedPlantsText, canSeeCost, currentSalesAccess, plantAllowed } from "./salesAccess.service";
 import { businessTimeZone, businessToday, fetchSalesItems, getSalesOrderRecords, sapStatus, shiftDate, type SalesItemRecord } from "./sapSales.service";
 
-export type GroupBy = "none" | "currency" | "plant" | "material" | "material_group" | "item_category" | "route" | "shipping_point" | "date" | "hour";
+export type GroupBy =
+  | "none"
+  | "currency"
+  | "plant"
+  | "material"
+  | "material_group"
+  | "item_category"
+  | "route"
+  | "shipping_point"
+  | "division"
+  | "sales_district"
+  | "customer_group"
+  | "date"
+  | "month"
+  | "hour";
 export type DateBasis = "created" | "billing_date";
 export type StatusType =
   | "delivery_pending"
@@ -22,7 +36,7 @@ export type StatusType =
   | "zero_value";
 export type Metric = "quantity" | "net_amount" | "cost_amount" | "order_count";
 export type CompareMetric = "quantity" | "net_amount" | "tax_amount" | "cost_amount" | "order_count" | "item_count";
-export type Dimension = "material" | "material_group" | "plant" | "route" | "order";
+export type Dimension = "material" | "material_group" | "plant" | "route" | "division" | "sales_district" | "customer_group" | "order";
 
 export interface SalesFilters {
   plant?: string | string[];
@@ -32,10 +46,17 @@ export interface SalesFilters {
   route?: string;
   shipping_point?: string;
   item_category?: string;
+  division?: string;
+  sales_district?: string;
+  customer_group?: string;
+  /** true = return items only, false = exclude return items. */
+  returns?: boolean;
   include_foc?: boolean;
 }
 
-export const MAX_RANGE_DAYS = 31;
+/** Longest range a question may cover (6 months); SAP is still queried one calendar month at a time. */
+export const MAX_RANGE_DAYS = 186;
+const SEARCH_DAYS = 31;
 const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 
 export class ToolInputError extends Error {
@@ -53,9 +74,28 @@ export function displayDate(iso: string): string {
   return `${String(day).padStart(2, "0")}-${MONTHS[month - 1]}-${year}`;
 }
 
+/** "2026-07" → "Jul-2026". */
+function displayMonth(yearMonth: string): string {
+  const [year, month] = yearMonth.split("-").map(Number);
+  return year && month ? `${MONTHS[month - 1]}-${year}` : yearMonth;
+}
+
+let zoneFormat: { zone: string; format: Intl.DateTimeFormat; days: Map<number, string> } | null = null;
+
 function isoInZone(date: Date | null | undefined): string {
   if (!date) return "";
-  return new Intl.DateTimeFormat("en-CA", { timeZone: businessTimeZone(), year: "numeric", month: "2-digit", day: "2-digit" }).format(date);
+  const zone = businessTimeZone();
+  if (zoneFormat?.zone !== zone) {
+    zoneFormat = { zone, format: new Intl.DateTimeFormat("en-CA", { timeZone: zone, year: "numeric", month: "2-digit", day: "2-digit" }), days: new Map() };
+  }
+  const time = date.getTime();
+  let value = zoneFormat.days.get(time);
+  if (value === undefined) {
+    value = zoneFormat.format.format(date);
+    if (zoneFormat.days.size > 50_000) zoneFormat.days.clear();
+    zoneFormat.days.set(time, value);
+  }
+  return value;
 }
 
 /** "28-Sep-2026 11:05" in the business time zone. */
@@ -75,7 +115,7 @@ function daysBetween(from: string, to: string): number {
 }
 
 function rangeTooLarge(): ToolInputError {
-  return new ToolInputError(`Date range is more than ${MAX_RANGE_DAYS} days. Please narrow it down (for example this month or last 30 days).`, "range_too_large");
+  return new ToolInputError("Date range is more than 6 months. Please narrow it down (for example last 3 months or this month).", "range_too_large");
 }
 
 export function normalizeRange(dateFrom?: string, dateTo?: string, now = new Date()): { from: string; to: string; defaulted: boolean } {
@@ -100,9 +140,49 @@ interface RangeFetch {
 async function loadRange(from: string, to: string, basis: DateBasis = "created"): Promise<RangeFetch> {
   if (daysBetween(from, to) + 1 > MAX_RANGE_DAYS) throw rangeTooLarge();
   const field = basis === "billing_date" ? "BillingDocumentDate" : "CreationDate";
-  const filter = `${field} ge datetime'${from}T00:00:00' and ${field} lt datetime'${shiftDate(to, 1)}T00:00:00'`;
-  const result = await fetchSalesItems(filter);
-  return { records: result.records, retrievedAt: result.retrievedAt, partial: result.stats.truncated };
+  const chunks: Array<[string, string]> = daysBetween(from, to) + 1 > SEARCH_DAYS ? halfMonthChunks(from, to) : [[from, to]];
+  const currentMonth = businessToday().date.slice(0, 7);
+  const results = await mapLimit(chunks, SAP_PARALLEL, ([start, end]) =>
+    fetchSalesItems(
+      `${field} ge datetime'${start}T00:00:00' and ${field} lt datetime'${shiftDate(end, 1)}T00:00:00'`,
+      end.slice(0, 7) < currentMonth ? CLOSED_MONTH_TTL_MS : undefined,
+    ),
+  );
+  return {
+    records: results.flatMap((result) => result.records),
+    retrievedAt: results.map((result) => result.retrievedAt).sort()[0],
+    partial: results.some((result) => result.stats.truncated),
+  };
+}
+
+const SAP_PARALLEL = 6;
+const CLOSED_MONTH_TTL_MS = 10 * 60 * 1000;
+
+/** 1st–15th and 16th–month end pieces: SAP pages each query sequentially, so smaller parallel queries finish sooner. */
+function halfMonthChunks(from: string, to: string): Array<[string, string]> {
+  const chunks: Array<[string, string]> = [];
+  let start = from;
+  while (start <= to) {
+    const [year, month, day] = start.split("-").map(Number);
+    const pieceEnd = day <= 15 ? `${start.slice(0, 8)}15` : shiftDate(new Date(Date.UTC(year, month, 1)).toISOString().slice(0, 10), -1);
+    const end = pieceEnd < to ? pieceEnd : to;
+    chunks.push([start, end]);
+    start = shiftDate(end, 1);
+  }
+  return chunks;
+}
+
+async function mapLimit<T, R>(list: T[], limit: number, run: (entry: T) => Promise<R>): Promise<R[]> {
+  const results = new Array<R>(list.length);
+  let next = 0;
+  const worker = async () => {
+    while (next < list.length) {
+      const index = next++;
+      results[index] = await run(list[index]);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(limit, list.length) }, worker));
+  return results;
 }
 
 /** Filtered raw items for a range (TAG rows included; callers decide how to treat them). */
@@ -152,6 +232,9 @@ function applyFilters(items: SalesItemRecord[], filters: SalesFilters = {}): Sal
   const route = filters.route?.trim().toUpperCase();
   const shipping = filters.shipping_point?.trim().toUpperCase();
   const category = filters.item_category?.trim().toUpperCase();
+  const division = filters.division?.trim().toUpperCase();
+  const district = filters.sales_district?.trim().toUpperCase();
+  const customerGroup = filters.customer_group?.trim().toUpperCase();
   return items.filter((item) => {
     if (plants.length && !plants.includes(item.Plant.toUpperCase())) return false;
     if (material && !compact(item.Material).includes(material)) return false;
@@ -160,6 +243,10 @@ function applyFilters(items: SalesItemRecord[], filters: SalesFilters = {}): Sal
     if (route && (item.Route ?? "").toUpperCase() !== route) return false;
     if (shipping && (item.ShippingPoint ?? "").toUpperCase() !== shipping) return false;
     if (category && (item.ItemCategory ?? "").toUpperCase() !== category) return false;
+    if (division && (item.Division ?? "").toUpperCase() !== division) return false;
+    if (district && (item.SalesDistrict ?? "").toUpperCase() !== district) return false;
+    if (customerGroup && (item.CustomerGroup ?? "").toUpperCase() !== customerGroup) return false;
+    if (filters.returns !== undefined && Boolean(item.IsReturnsItem) !== filters.returns) return false;
     return true;
   });
 }
@@ -333,6 +420,8 @@ export function dataNotes(items: SalesItemRecord[]): string[] {
   }
   const incomplete = items.filter((item) => !isTag(item) && incompleteFields(item).length > 0);
   if (incomplete.length) notes.push(`${incomplete.length} item(s) are incomplete (${[...new Set(incomplete.flatMap(incompleteFields))].join(", ")}).`);
+  const returns = items.filter((item) => isRegular(item) && item.IsReturnsItem);
+  if (returns.length) notes.push(`${returns.length} return item(s) are included in the totals (orders ${orderList(returns)}).`);
   return notes;
 }
 
@@ -350,8 +439,16 @@ function groupKey(item: SalesItemRecord, groupBy: GroupBy, basis: DateBasis): st
       return item.Route || "No route";
     case "shipping_point":
       return item.ShippingPoint || "—";
+    case "division":
+      return item.Division || "Not assigned";
+    case "sales_district":
+      return item.SalesDistrict || "Not assigned";
+    case "customer_group":
+      return item.CustomerGroup || "Not assigned";
     case "date":
       return isoInZone(basis === "billing_date" ? item.BillingDocumentDate : item.CreationDate);
+    case "month":
+      return isoInZone(basis === "billing_date" ? item.BillingDocumentDate : item.CreationDate).slice(0, 7);
     case "hour":
       return `${(item.CreationTime || "00").slice(0, 2)}:00`;
     default:
@@ -381,6 +478,7 @@ export async function getSalesSummary(
   const tagRows = all.filter(isTag).length;
   const foc = all.filter(isFoc);
   const regular = all.filter(isRegular);
+  const returns = regular.filter((item) => item.IsReturnsItem);
   const groupBy: GroupBy = args.group_by ?? "none";
   const focOnly = focOnlyOrders(all);
 
@@ -395,11 +493,11 @@ export async function getSalesSummary(
       add(map.get(id)!.b, item);
     }
     const sorted = [...map.values()].sort((a, b) =>
-      groupBy === "date" || groupBy === "hour" ? a.key.localeCompare(b.key) || a.currency.localeCompare(b.currency) : b.b.quantity - a.b.quantity,
+      groupBy === "date" || groupBy === "month" || groupBy === "hour" ? a.key.localeCompare(b.key) || a.currency.localeCompare(b.currency) : b.b.quantity - a.b.quantity,
     );
     groupCount = sorted.length;
     groups = sorted.slice(0, 50).map(({ key, currency, b }) => ({
-      [groupBy]: groupBy === "date" ? displayDate(key) : key,
+      [groupBy]: groupBy === "date" ? displayDate(key) : groupBy === "month" ? displayMonth(key) : key,
       currency,
       orders: b.orders.size,
       items: b.items,
@@ -444,6 +542,13 @@ export async function getSalesSummary(
     foc_only_order_count: focOnly.size,
     item_count: regular.length,
     total_quantity: regular.reduce((sum, item) => sum + item.OrderQuantity, 0),
+    confirmed_quantity: regular.reduce((sum, item) => sum + (item.ConfirmedOrderQuantity ?? 0), 0),
+    returns: {
+      items: returns.length,
+      orders: new Set(returns.map((item) => item.SalesOrder)).size,
+      quantity: returns.reduce((sum, item) => sum + item.OrderQuantity, 0),
+      by_currency: currencyRows(returns).map(({ currency, items: count, quantity, net_amount }) => ({ currency, items: count, quantity, net_amount })),
+    },
     by_currency: perCurrency.sort((a, b) => a.currency.localeCompare(b.currency)),
     foc: {
       items: foc.length,
@@ -511,6 +616,10 @@ export async function getOrderDetails(args: { sales_order?: string }) {
       material: item.Material,
       material_group: item.MaterialGroup,
       plant: item.Plant,
+      division: item.Division || null,
+      sales_district: item.SalesDistrict || null,
+      customer_group: item.CustomerGroup || null,
+      is_return: Boolean(item.IsReturnsItem),
       quantity: item.OrderQuantity,
       confirmed_quantity: item.ConfirmedQuantity ?? 0,
       unit: item.BaseUnit || item.OrderQuantityUnit,
@@ -643,7 +752,7 @@ export async function topN(
   const items = applyFilters(fetched.records, args.filters).filter((item) => (args.filters?.include_foc ? !isTag(item) : isRegular(item)));
   const byCurrency = metric === "net_amount" || metric === "cost_amount";
   const keyOf = (item: SalesItemRecord) =>
-    dimension === "order" ? orderNumber(item.SalesOrder) : dimension === "material_group" ? item.MaterialGroup || "—" : dimension === "plant" ? item.Plant || "—" : dimension === "route" ? item.Route || "No route" : item.Material || "—";
+    dimension === "order" ? orderNumber(item.SalesOrder) : dimension === "material" ? item.Material || "—" : groupKey(item, dimension, "created");
 
   const map = new Map<string, { key: string; currency?: string; b: Bucket }>();
   for (const item of items) {
@@ -717,6 +826,8 @@ export async function comparePeriods(args: { period_a?: PeriodArg; period_b?: Pe
       order_count: { a: a.order_count, b: b.order_count, ...change(a.order_count, b.order_count) },
       item_count: { a: a.item_count, b: b.item_count, ...change(a.item_count, b.item_count) },
       total_quantity: { a: a.total_quantity, b: b.total_quantity, ...change(a.total_quantity, b.total_quantity) },
+      confirmed_quantity: { a: a.confirmed_quantity, b: b.confirmed_quantity, ...change(a.confirmed_quantity, b.confirmed_quantity) },
+      return_items: { a: a.returns.items, b: b.returns.items, ...change(a.returns.items, b.returns.items) },
       foc_items: { a: a.foc.items, b: b.foc.items, ...change(a.foc.items, b.foc.items) },
     },
     by_currency: currencies.map((currency) => {
@@ -745,7 +856,7 @@ export async function searchMaterial(args: { text?: string }, now = new Date()) 
   const text = String(args.text ?? "").trim();
   if (compact(text).length < 3) throw new ToolInputError("Give at least 3 characters of the material or style code.");
   const today = businessToday(now).date;
-  const from = shiftDate(today, -(MAX_RANGE_DAYS - 1));
+  const from = shiftDate(today, -(SEARCH_DAYS - 1));
   const fetched = await loadRange(from, today);
   const needle = compact(text);
   const matches = fetched.records.filter((item) => compact(item.Material).includes(needle));
@@ -783,7 +894,7 @@ export async function searchMaterial(args: { text?: string }, now = new Date()) 
       rows: matches.length,
       partial: fetched.partial,
       retrievedAt: fetched.retrievedAt,
-      warnings: [`Searched items created in the last ${MAX_RANGE_DAYS} days.`, ...(rows.length > 20 ? [`Showing 20 of ${rows.length} matching materials.`] : [])],
+      warnings: [`Searched items created in the last ${SEARCH_DAYS} days.`, ...(rows.length > 20 ? [`Showing 20 of ${rows.length} matching materials.`] : [])],
     }),
   };
 }
@@ -846,13 +957,17 @@ const FILTER_SCHEMA = {
     route: { type: "string" },
     shipping_point: { type: "string" },
     item_category: { type: "string", description: "ZTAM, ZTAN, YTAN, ZFOC or TAG." },
+    division: { type: "string", description: "Division code exactly as in the data." },
+    sales_district: { type: "string", description: "Sales district code exactly as in the data." },
+    customer_group: { type: "string", description: "Customer group code exactly as in the data (customer names are not available)." },
+    returns: { type: "boolean", description: "true = return items only (IsReturnsItem), false = exclude return items." },
     include_foc: { type: "boolean", description: "Only for top_n: include FOC items." },
   },
   additionalProperties: false,
 };
 
 const DATE_PROPS = {
-  date_from: { type: "string", description: "Start date YYYY-MM-DD (inclusive, IST). Range max 31 days." },
+  date_from: { type: "string", description: "Start date YYYY-MM-DD (inclusive, IST). Range max 6 months; use group_by month for ranges over one month." },
   date_to: { type: "string", description: "End date YYYY-MM-DD (inclusive, IST)." },
 };
 
@@ -869,7 +984,7 @@ export const SALES_TOOL_DEFINITIONS = [
     function: {
       name: "get_sales_summary",
       description:
-        "Sales totals for a date range. Per currency: order_count, foc_only_order_count, item_count, total_quantity, net_amount, tax_amount, cost_amount. TAG rows excluded, FOC reported separately (foc value/tax/cost). Optional grouping.",
+        "Sales totals for a date range. Per currency: order_count, foc_only_order_count, item_count, total_quantity, net_amount, tax_amount, cost_amount. Also confirmed_quantity and returns (items, orders, quantity, per-currency net). TAG rows excluded, FOC reported separately (foc value/tax/cost). Optional grouping.",
       parameters: {
         type: "object",
         properties: {
@@ -877,7 +992,7 @@ export const SALES_TOOL_DEFINITIONS = [
           date_basis: { type: "string", enum: ["created", "billing_date"], description: "Default created." },
           group_by: {
             type: "string",
-            enum: ["none", "currency", "plant", "material", "material_group", "item_category", "route", "shipping_point", "date", "hour"],
+            enum: ["none", "currency", "plant", "material", "material_group", "item_category", "route", "shipping_point", "division", "sales_district", "customer_group", "date", "month", "hour"],
           },
           filters: FILTER_SCHEMA,
         },
@@ -928,7 +1043,7 @@ export const SALES_TOOL_DEFINITIONS = [
         type: "object",
         properties: {
           metric: { type: "string", enum: ["quantity", "net_amount", "cost_amount", "order_count"] },
-          dimension: { type: "string", enum: ["material", "material_group", "plant", "route", "order"] },
+          dimension: { type: "string", enum: ["material", "material_group", "plant", "route", "division", "sales_district", "customer_group", "order"] },
           ...DATE_PROPS,
           n: { type: "integer", minimum: 1, maximum: 10 },
           filters: FILTER_SCHEMA,
@@ -942,7 +1057,8 @@ export const SALES_TOOL_DEFINITIONS = [
     type: "function",
     function: {
       name: "compare_periods",
-      description: "Compare two date ranges: orders, items, quantity, FOC items and per-currency net/tax/cost with difference and change %. Use for every comparison.",
+      description:
+        "Compare two date ranges: orders, items, quantity, confirmed quantity, return items, FOC items and per-currency net/tax/cost with difference and change % (change_pct null = previous period is zero). period_a = current, period_b = previous. Use for every comparison.",
       parameters: {
         type: "object",
         properties: {

@@ -381,8 +381,8 @@ async function main(): Promise<void> {
   await runWithSalesAccess(salesUser, () => runSalesTool("top_n", { ...v2Range, metric: "cost_amount", dimension: "material" }, fixedNow)).catch((error: Error) => (costError = error.message));
   ok("sales_user: cost ranking refused", /not available/.test(costError), costError);
   let rangeError = "";
-  await runSalesTool("get_sales_summary", { date_from: "2026-07-01", date_to: "2026-09-25" }, fixedNow).catch((error: Error) => (rangeError = error.message));
-  ok("range over 31 days refused", /31 days/.test(rangeError), rangeError);
+  await runSalesTool("get_sales_summary", { date_from: "2026-01-01", date_to: "2026-09-25" }, fixedNow).catch((error: Error) => (rangeError = error.message));
+  ok("range over 6 months refused", /6 months/.test(rangeError), rangeError);
   const compared = (await runWithSalesAccess(manager, () => runSalesTool("compare_periods", { period_a: v2Range, period_b: { date_from: "2026-08-01", date_to: "2026-08-25" } }, fixedNow))) as Record<string, any>;
   ok("compare_periods returns differences", typeof compared.totals?.item_count?.difference === "number" && Array.isArray(compared.by_currency));
   const search = (await runWithSalesAccess(manager, () => runSalesTool("search_material", { text: "mat-a" }, fixedNow))) as Record<string, any>;
@@ -402,11 +402,91 @@ async function main(): Promise<void> {
   const basis = await rules("sales this month");
   ok("rules: based-on + data-as-of line", /Based on items created from 01-Sep-2026 to 25-Sep-2026\. Data as of /.test(basis?.message ?? ""), basis?.message);
   const bigRange = await rules("sales in 2026");
-  ok("rules: big range asks to narrow", /31 days/.test(bigRange?.message ?? ""), bigRange?.message);
+  ok("rules: big range asks to narrow", /6 months/.test(bigRange?.message ?? ""), bigRange?.message);
+
+  const sapFilters: string[] = [];
+  setSapFetch(async (url) => {
+    const decoded = decodeURIComponent(String(url));
+    sapFilters.push(decoded);
+    const month = /CreationDate ge datetime'(\d{4}-\d{2})-01/.exec(decoded)?.[1];
+    const rows = month
+      ? [
+          sapRow(`7${month.slice(5)}01`, "10", { CreationDate: `/Date(${Date.parse(`${month}-10T00:00:00Z`)})/`, NetAmount: "100.00", OrderQuantity: "10" }),
+          sapRow(`7${month.slice(5)}02`, "10", { CreationDate: `/Date(${Date.parse(`${month}-12T00:00:00Z`)})/`, NetAmount: "50.00", OrderQuantity: "5" }),
+        ]
+      : [];
+    return json({ d: { results: rows } });
+  });
+  const threeMonths = await rules("i want last 3 Month");
+  ok("rules: 'last 3 Month' → 01-Jul to today", /Last 3 months \(01-Jul-2026 to 25-Sep-2026\)/.test(threeMonths?.message ?? ""), threeMonths?.message);
+  ok("rules: long range → month-wise table", /\| Month \|/.test(threeMonths?.message ?? "") && /Jul-2026/.test(threeMonths?.message ?? "") && /Sep-2026/.test(threeMonths?.message ?? ""), threeMonths?.message);
+  ok("long range queried in half-month pieces", sapFilters.filter((filter) => /CreationDate ge/.test(filter)).length === 6, String(sapFilters.length));
+  const noSpace = await rules("I want last 3month data in sales");
+  ok("rules: '3month' (no space) parsed", /Last 3 months/.test(noSpace?.message ?? ""), noSpace?.message);
+  const weeks = await rules("sales last 2 weeks");
+  ok("rules: last 2 weeks = 14 days", /Last 2 weeks \(12-Sep-2026 to 25-Sep-2026\)/.test(weeks?.message ?? ""), weeks?.message);
+  const quarter = await rules("last quarter sales");
+  ok("rules: last quarter = Apr–Jun", /Last quarter \(01-Apr-2026 to 30-Jun-2026\)/.test(quarter?.message ?? ""), quarter?.message);
+  const tooLong = await rules("sales last 12 months");
+  ok("rules: 12 months refused", /6 months/.test(tooLong?.message ?? ""), tooLong?.message);
   const help = salesHelpReply("enna panna mudiyum");
   ok("help: Tanglish intro + 5 examples", /Evolv Sales Assistant/.test(help.message) && (help.suggestions?.length ?? 0) === 5);
   const forecast = await rules("next week sales increase aagumaa?");
   ok("rules: forecast declined", /Forecast panna ennala mudiyadhu/.test(forecast?.message ?? ""), forecast?.message);
+
+  console.log("Sales Assistant v3: master prompt rules");
+  clearSapCache();
+  setSapFetch(async (url) => {
+    const decoded = decodeURIComponent(String(url));
+    const month = /CreationDate ge datetime'(\d{4}-\d{2})-/.exec(decoded)?.[1];
+    const at = (day: string) => `/Date(${Date.parse(`${month}-${day}T00:00:00Z`)})/`;
+    const rows =
+      month === "2026-08"
+        ? [
+            sapRow("8001", "10", { CreationDate: at("05"), SalesOrderItemCategory: "ZTAN", NetAmount: "300.00", TaxAmount: "30.00", OrderQuantity: "30", TransactionCurrency: "EUR", Division: "10", SalesDistrict: "000123", CustomerGroup: "01", ConfdDelivQtyInOrderQtyUnit: "25.000" }),
+            sapRow("8002", "10", { CreationDate: at("06"), SalesOrderItemCategory: "ZTAN", NetAmount: "-40.00", OrderQuantity: "4", TransactionCurrency: "EUR", Division: "20", CustomerGroup: "02", IsReturnsItem: true }),
+            sapRow("8003", "10", { CreationDate: at("07"), SalesOrderItemCategory: "ZTAN", NetAmount: "50.00", TaxAmount: "5.00", TransactionCurrency: "USD", Division: "10", CustomerGroup: "01" }),
+          ]
+        : month === "2026-07"
+          ? [sapRow("7001", "10", { CreationDate: at("05"), SalesOrderItemCategory: "ZTAN", NetAmount: "200.00", TaxAmount: "20.00", OrderQuantity: "20", TransactionCurrency: "EUR", Division: "10", CustomerGroup: "01", ConfdDelivQtyInOrderQtyUnit: "20.000" })]
+          : [];
+    return json({ d: { results: rows } });
+  });
+
+  const august = { date_from: "2026-08-01", date_to: "2026-08-31" };
+  const augSummary = (await runWithSalesAccess(manager, () => runSalesTool("get_sales_summary", august, fixedNow))) as Record<string, any>;
+  ok("summary: confirmed quantity (order unit)", augSummary.confirmed_quantity === 25, String(augSummary.confirmed_quantity));
+  ok("summary: return items counted", augSummary.returns?.items === 1 && augSummary.returns.quantity === 4, JSON.stringify(augSummary.returns));
+  ok("summary: returns noted in data notes", augSummary.data_notes.some((note: string) => /return item\(s\) are included/.test(note)), JSON.stringify(augSummary.data_notes));
+  const byGroup = (await runWithSalesAccess(manager, () => runSalesTool("get_sales_summary", { ...august, group_by: "customer_group" }, fixedNow))) as Record<string, any>;
+  ok("summary: group by customer group", byGroup.groups?.some((group: any) => group.customer_group === "01" && group.orders === 1), JSON.stringify(byGroup.groups));
+  const onlyReturns = (await runWithSalesAccess(manager, () => runSalesTool("get_sales_summary", { ...august, filters: { returns: true } }, fixedNow))) as Record<string, any>;
+  ok("filter: returns only", onlyReturns.item_count === 1, String(onlyReturns.item_count));
+  const topDivision = (await runWithSalesAccess(manager, () => runSalesTool("top_n", { ...august, metric: "quantity", dimension: "division" }, fixedNow))) as Record<string, any>;
+  ok("top_n: by division", topDivision.rows?.[0]?.division === "10" && topDivision.rows[0].value === 35, JSON.stringify(topDivision.rows));
+
+  const monthCompare = await rules("compare last month");
+  const cmpText = monthCompare?.message ?? "";
+  ok("compare: last month vs full previous month", /\| Metric \| July 2026 \| Last month \| Difference \| % Change \|/.test(cmpText), cmpText);
+  ok("compare: previous → current with signed difference", /\| Sales orders \| 1 \| 3 \| \+2 \| \+200% \|/.test(cmpText), cmpText);
+  ok("compare: N/A when previous is zero", /\| Net amount USD \| 0\.00 \| 50\.00 \| \+50\.00 \| N\/A \|/.test(cmpText) && /N\/A = the previous period value is zero/.test(cmpText), cmpText);
+  ok("compare: tax row per currency", /\| Tax amount EUR \| 20\.00 \| 30\.00 \| \+10\.00 \| \+50% \|/.test(cmpText), cmpText);
+  ok("compare: confirmed qty + return rows", /\| Confirmed delivery qty \| 20 \| 25 \| \+5 \| \+25% \|/.test(cmpText) && /\| Return items \| 0 \| 1 \| \+1 \| N\/A \|/.test(cmpText), cmpText);
+  ok("compare: factual headline", /^Last month vs July 2026: sales orders up 2 \(\+200%\), quantity up 19 units \(\+95%\)\./.test(cmpText), cmpText);
+  ok("compare: exact spans stated", /July 2026 = 01-Jul-2026 to 31-Jul-2026; Last month = 01-Aug-2026 to 31-Aug-2026/.test(cmpText), cmpText);
+
+  const customerWise = await rules("customer wise sales this month");
+  ok("customer-wise → customer group offer", /Customer name is not available in the current Sales API response\. I can provide Customer Group-wise analysis\./.test(customerWise?.message ?? ""), customerWise?.message);
+  const groupWise = await rules("customer group wise sales last month");
+  ok("rules: customer group-wise table", /\| Customer Group \|/.test(groupWise?.message ?? "") && /\| 01 \|/.test(groupWise?.message ?? ""), groupWise?.message);
+  const divisionWise = await rules("division wise sales last month");
+  ok("rules: division-wise table", /\| Division \|/.test(divisionWise?.message ?? ""), divisionWise?.message);
+  const returnItems = await rules("return items last month");
+  ok("rules: returns filter", /return items only: 1 order, 1 item, 4 units/.test(returnItems?.message ?? ""), returnItems?.message);
+  const groupFilter = await rules("sales last month customer group 01");
+  ok("rules: customer group filter", /customer group 01: 2 orders/.test(groupFilter?.message ?? ""), groupFilter?.message);
+  const districtFilter = await rules("sales last month sales district 000123");
+  ok("rules: district code is not an order number", /sales district 000123: 1 order/.test(districtFilter?.message ?? ""), districtFilter?.message);
   setSapFetch();
 
   console.log(`\n${passed} passed, ${failed} failed`);

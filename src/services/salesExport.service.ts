@@ -305,8 +305,8 @@ export function toXlsx(sheets: ExportSheet[]): Buffer {
 
 // ---------- PDF (Helvetica, WinAnsi, multi-page, tables) ----------
 
-const PAGE_W = 595;
-const PAGE_H = 842;
+const PAGE_W = 595.28;
+const PAGE_H = 841.89;
 const MARGIN = 40;
 
 function pdfText(value: string): string {
@@ -357,7 +357,7 @@ class PdfPages {
     }
   }
 
-  text(value: string, x: number, size: number, bold = false, color = "0.12 0.16 0.23"): void {
+  text(value: string, x: number, size: number, bold = false, color = "0.1 0.1 0.1"): void {
     this.ops.push(`BT ${color} rg /${bold ? "F2" : "F1"} ${size} Tf ${x.toFixed(1)} ${this.y.toFixed(1)} Td (${pdfText(value)}) Tj ET`);
   }
 
@@ -376,7 +376,7 @@ class PdfPages {
   heading(value: string): void {
     this.ensure(40);
     this.y -= 8;
-    this.text(value, MARGIN, 13, true, "0.26 0.22 0.79");
+    this.text(value, MARGIN, 13, true, "0 0 0");
     this.y -= 18;
   }
 
@@ -393,7 +393,7 @@ class PdfPages {
     const lefts = widths.map((_, index) => MARGIN + widths.slice(0, index).reduce((sum, value) => sum + value, 0));
     const header = () => {
       this.ensure(34);
-      this.rect(MARGIN, this.y - 4, width, 14, "0.88 0.91 1");
+      this.rect(MARGIN, this.y - 4, width, 14, "0.88 0.88 0.88");
       columns.forEach((column, index) => this.text(fit(column, widths[index] - 4, size), lefts[index] + 2, size, true));
       this.y -= 15;
     };
@@ -403,7 +403,7 @@ class PdfPages {
         this.ensure(1000);
         header();
       }
-      if (rowIndex % 2 === 1) this.rect(MARGIN, this.y - 4, width, 13, "0.97 0.97 0.99");
+      if (rowIndex % 2 === 1) this.rect(MARGIN, this.y - 4, width, 13, "0.96 0.96 0.96");
       row.forEach((cell, index) => this.text(fit(String(cell ?? ""), widths[index] - 4, size), lefts[index] + 2, size));
       this.y -= 13;
     });
@@ -413,11 +413,11 @@ class PdfPages {
 
 export function toPdf(doc: ExportDocument): Buffer {
   const pdf = new PdfPages();
-  pdf.rect(0, PAGE_H - 70, PAGE_W, 70, "0.31 0.27 0.9");
+  pdf.rect(0, PAGE_H - 70, PAGE_W, 70, "0 0 0");
   pdf.y = PAGE_H - 38;
   pdf.text(doc.title, MARGIN, 17, true, "1 1 1");
   pdf.y -= 18;
-  pdf.text(`Source: SAP Sales API (ZI_SalesApi_HUB)  |  Retrieved: ${doc.retrievedAt.replace("T", " ").slice(0, 19)} UTC`, MARGIN, 9, false, "0.9 0.92 1");
+  pdf.text(`Source: SAP Sales API (ZI_SalesApi_HUB)  |  Retrieved: ${doc.retrievedAt.replace("T", " ").slice(0, 19)} UTC`, MARGIN, 9, false, "0.85 0.85 0.85");
   pdf.y = PAGE_H - 96;
 
   if (doc.kpis.length > 0) {
@@ -428,8 +428,8 @@ export function toPdf(doc: ExportDocument): Buffer {
       if (index % perRow === 0) pdf.ensure(46);
       const x = MARGIN + (index % perRow) * (boxW + 6);
       const valueSize = Math.max(7, Math.min(10, (boxW - 10) / (Math.max(1, kpi.value.length) * 0.55)));
-      pdf.rect(x, pdf.y - 26, boxW, 38, "0.95 0.96 1");
-      pdf.text(fit(kpi.label, boxW - 10, 8), x + 6, 8, false, "0.4 0.45 0.55");
+      pdf.rect(x, pdf.y - 26, boxW, 38, "0.95 0.95 0.95");
+      pdf.text(fit(kpi.label, boxW - 10, 8), x + 6, 8, false, "0.4 0.4 0.4");
       const saved = pdf.y;
       pdf.y -= 16;
       pdf.text(fit(kpi.value, boxW - 10, valueSize), x + 6, valueSize, true);
@@ -458,7 +458,7 @@ export function toPdf(doc: ExportDocument): Buffer {
   objects[3] = "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>";
   objects[4] = "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold /Encoding /WinAnsiEncoding >>";
   pdf.pages.forEach((ops, index) => {
-    const footer = `BT 0.5 0.55 0.62 rg /F1 8 Tf ${MARGIN} 22 Td (${pdfText(`EVOLV AI Sales Analyst  |  ${doc.period}  |  Page ${index + 1} of ${total}`)}) Tj ET`;
+    const footer = `BT 0.45 0.45 0.45 rg /F1 8 Tf ${MARGIN} 22 Td (${pdfText(`EVOLV AI Sales Analyst  |  ${doc.period}  |  Page ${index + 1} of ${total}`)}) Tj ET`;
     const stream = [...ops, footer].join("\n");
     const contentId = 5 + index * 2;
     const pageId = contentId + 1;

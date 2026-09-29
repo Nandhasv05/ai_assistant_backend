@@ -1,6 +1,6 @@
 /*
- * Evolv Sales Assistant (prompt v2.0): read-only answers about SAP Sales order items.
- * With a real AI_API_KEY the LLM follows the v2.0 prompt and calls the six sales tools.
+ * Evolv Sales Assistant (prompt v3.0): read-only answers about SAP Sales order items.
+ * With a real AI_API_KEY the LLM follows the v3.0 prompt and calls the six sales tools.
  * Without one (or if the LLM fails) a rule planner calls the same tools and answers in the same style.
  * Role / allowed plants come from the signed portal context (salesAccess.service), never from the chat.
  */
@@ -235,6 +235,14 @@ function monthPeriod(month: number, year: number, today: string): Period {
   return rangePeriod(from, to, name);
 }
 
+const COUNT_WORDS = ["", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten", "eleven", "twelve"];
+const COUNT_RE = `(\\d{1,2}|${COUNT_WORDS.slice(1).join("|")})`;
+
+function countValue(value: string): number {
+  const count = /^\d+$/.test(value) ? Number(value) : COUNT_WORDS.indexOf(value.toLowerCase());
+  return count > 0 ? count : 0;
+}
+
 interface Found {
   index: number;
   period: Period;
@@ -300,7 +308,37 @@ function findPeriods(input: string, today: string): { found: Found[]; masked: st
     return dayPeriod(shiftDate(today, -back), today);
   });
   take(/\b(this|current) year\b/, () => rangePeriod(`${today.slice(0, 4)}-01-01`, today, "This year", "this year"));
-  take(/\b(last|past) (\d{1,3}) days\b/, (m) => {
+  take(new RegExp(`\\b(?:(?:last|past|previous|pona|kadandha)\\s*)?${COUNT_RE}\\s*(months?|mnths?|mths?|maasam)\\b`), (m) => {
+    const months = countValue(m[1]);
+    if (!months) return null;
+    const [year, month] = today.split("-").map(Number);
+    const from = new Date(Date.UTC(year, month - months, 1)).toISOString().slice(0, 10);
+    const label = months === 1 ? "This month" : `Last ${months} months`;
+    return rangePeriod(from, today, label, months === 1 ? "this month" : `last ${months} months`);
+  });
+  take(new RegExp(`\\b(?:last|past|previous|pona|kadandha)\\s*${COUNT_RE}\\s*(weeks?|wks?|vaaram)\\b`), (m) => {
+    const weeks = countValue(m[1]);
+    if (!weeks) return null;
+    return rangePeriod(shiftDate(today, -(weeks * 7 - 1)), today, `Last ${weeks} weeks`, `last ${weeks} weeks`);
+  });
+  take(/\b(this|current|last|previous) quarter\b/, (m) => {
+    const [year, month] = today.split("-").map(Number);
+    const startMonth = Math.floor((month - 1) / 3) * 3 - (/this|current/.test(m[1]) ? 0 : 3);
+    const from = new Date(Date.UTC(year, startMonth, 1)).toISOString().slice(0, 10);
+    const end = shiftDate(new Date(Date.UTC(year, startMonth + 3, 1)).toISOString().slice(0, 10), -1);
+    const current = /this|current/.test(m[1]);
+    return rangePeriod(from, end > today ? today : end, current ? "This quarter" : "Last quarter", current ? "this quarter" : "last quarter");
+  });
+  take(new RegExp(`\\b(?:last|past|previous)\\s*${COUNT_RE}\\s*(years?|yrs?)\\b`), (m) => {
+    const years = countValue(m[1]);
+    if (!years) return null;
+    return rangePeriod(shiftDate(today, -(years * 365 - 1)), today, `Last ${years} years`, `last ${years} years`);
+  });
+  take(/\b(?:last|past|previous) year\b/, () => {
+    const year = Number(today.slice(0, 4)) - 1;
+    return rangePeriod(`${year}-01-01`, `${year}-12-31`, String(year));
+  });
+  take(/\b(last|past) (\d{1,3})\s*days?\b/, (m) => {
     const days = Math.max(1, Math.min(Number(m[2]), 366));
     return rangePeriod(shiftDate(today, -(days - 1)), today, `Last ${days} days`, `last ${days} days`);
   });
@@ -326,6 +364,10 @@ function findPeriods(input: string, today: string): { found: Found[]; masked: st
   return { found, masked: text, unclear };
 }
 
+function isFullMonth(period: { from: string; to: string }): boolean {
+  return period.from.endsWith("-01") && period.from.slice(0, 7) === period.to.slice(0, 7) && shiftDate(period.to, 1).endsWith("-01");
+}
+
 function previousPeriod(period: Period, today: string): Period {
   if (period.query === "today") return dayPeriod(shiftDate(today, -1), today);
   if (period.query === "yesterday") return dayPeriod(shiftDate(today, -2), today);
@@ -341,6 +383,10 @@ function previousPeriod(period: Period, today: string): Period {
     const prevEnd = shiftDate(first, -1);
     const to = Number(prevEnd.slice(8, 10)) < day ? prevEnd : `${prevFirst.slice(0, 8)}${String(day).padStart(2, "0")}`;
     return rangePeriod(prevFirst, to, "Same days last month", `from ${displayDate(prevFirst)} to ${displayDate(to)}`);
+  }
+  if (isFullMonth(period)) {
+    const previous = shiftDate(period.from, -1);
+    return monthPeriod(Number(previous.slice(5, 7)), Number(previous.slice(0, 4)), today);
   }
   const days = Math.round((Date.parse(period.to) - Date.parse(period.from)) / 86_400_000);
   const to = shiftDate(period.from, -1);
@@ -385,6 +431,19 @@ const GROUP_RE = /\bMC\d{6}\b/gi;
 const ROUTE_RE = /\bZ\d{5}\b/gi;
 const CATEGORY_RE = /\b(ZTAM|ZTAN|YTAN)\b/gi;
 const EXPLICIT_MATERIAL_RE = /\b(?:material|style|article|sku|item code)\s+(?!group|wise|by|per|summary|details?)([A-Z0-9][A-Z0-9-]{4,})\b/gi;
+/** Codes need a digit so "customer group wise" / "division wise" are not read as codes. */
+const CUSTOMER_GROUP_RE = /\bcustomer[- ]?group\s*(?:no\.?|code)?\s*[:#-]?\s*([A-Z0-9]*\d[A-Z0-9]*)\b/gi;
+const DIVISION_RE = /\bdivision\s*(?:no\.?|code)?\s*[:#-]?\s*([A-Z0-9]*\d[A-Z0-9]*)\b/gi;
+const DISTRICT_RE = /\b(?:sales[- ]?)?district\s*(?:no\.?|code)?\s*[:#-]?\s*([A-Z0-9]*\d[A-Z0-9]*)\b/gi;
+const RETURNS_RE = /\breturns?(?:[- ]?(?:items?|orders?|lines?|qty|quantity))?\b/i;
+
+function stripCodeFilters(text: string): string {
+  return text.replace(CUSTOMER_GROUP_RE, " ").replace(DIVISION_RE, " ").replace(DISTRICT_RE, " ");
+}
+
+function firstCode(regex: RegExp, text: string): string | undefined {
+  return [...text.matchAll(regex)][0]?.[1]?.toUpperCase();
+}
 
 /** Style / material codes typed without a label: mixed letters + digits, 7+ chars, not a plant, group, route or order. */
 function materialToken(masked: string): string | null {
@@ -409,8 +468,15 @@ function filtersFrom(text: string, masked = text.toLowerCase()): SalesFilters {
   if (route) filters.route = route.toUpperCase();
   const category = text.match(/\b(ZTAM|ZTAN|YTAN)\b/i)?.[1];
   if (category) filters.item_category = category.toUpperCase();
+  const customerGroup = firstCode(CUSTOMER_GROUP_RE, text);
+  if (customerGroup) filters.customer_group = customerGroup;
+  const division = firstCode(DIVISION_RE, text);
+  if (division) filters.division = division;
+  const district = firstCode(DISTRICT_RE, text);
+  if (district) filters.sales_district = district;
+  if (RETURNS_RE.test(text)) filters.returns = true;
   const explicit = [...text.matchAll(EXPLICIT_MATERIAL_RE)][0]?.[1];
-  const material = explicit ?? materialToken(masked);
+  const material = explicit ?? materialToken(stripCodeFilters(masked));
   if (material && !/^MC\d{6}$/i.test(material)) filters.material = material.toUpperCase();
   return filters;
 }
@@ -423,6 +489,10 @@ function filterText(filters: SalesFilters): string {
   if (filters.material) parts.push(`material ${filters.material}`);
   if (filters.route) parts.push(`route ${filters.route}`);
   if (filters.item_category) parts.push(filters.item_category);
+  if (filters.division) parts.push(`division ${filters.division}`);
+  if (filters.sales_district) parts.push(`sales district ${filters.sales_district}`);
+  if (filters.customer_group) parts.push(`customer group ${filters.customer_group}`);
+  if (filters.returns) parts.push("return items only");
   return parts.length ? `, ${parts.join(", ")}` : "";
 }
 
@@ -434,16 +504,41 @@ function filterQuery(filters: SalesFilters): string {
   if (filters.material) parts.push(`material ${filters.material}`);
   if (filters.route) parts.push(filters.route);
   if (filters.item_category) parts.push(filters.item_category);
+  if (filters.division) parts.push(`division ${filters.division}`);
+  if (filters.sales_district) parts.push(`sales district ${filters.sales_district}`);
+  if (filters.customer_group) parts.push(`customer group ${filters.customer_group}`);
+  if (filters.returns) parts.push("returns");
   return parts.length ? ` ${parts.join(" ")}` : "";
 }
 
+const GROUP_LABEL: Record<GroupBy, string> = {
+  plant: "Plant",
+  material: "Material",
+  material_group: "Material Group",
+  item_category: "Item Category",
+  route: "Route",
+  shipping_point: "Shipping Point",
+  division: "Division",
+  sales_district: "Sales District",
+  customer_group: "Customer Group",
+  date: "Date",
+  month: "Month",
+  hour: "Hour",
+  none: "",
+  currency: "",
+};
+
 function groupByFrom(text: string): GroupBy | null {
   if (/\bmaterial[- ]?group/.test(text)) return "material_group";
+  if (/\bcustomer[- ]?group/.test(text)) return "customer_group";
+  if (/\bsales[- ]?district|\bdistrict[- ]?wise\b|\b(by|per) district\b/.test(text)) return "sales_district";
+  if (/\bdivision[- ]?wise|\b(by|per|each) division\b|\bdivisions\b/.test(text)) return "division";
   if (/\bplant[- ]?(wise|split)|\b(by|per|each) plant\b/.test(text)) return "plant";
   if (/\bitem[- ]?category|\bcategory[- ]?wise\b/.test(text)) return "item_category";
   if (/\broute[- ]?wise|\b(by|per) route\b/.test(text)) return "route";
   if (/\bshipping[- ]?point/.test(text)) return "shipping_point";
   if (/\bhour(ly)?[- ]?wise|\bhourly\b|\b(by|per) hour\b/.test(text)) return "hour";
+  if (/\bmonth[- ]?wise|\bmonthly\b|\b(by|per|each) month\b|\bmaasam[- ]?vaariya/.test(text)) return "month";
   if (/\b(date|day)[- ]?wise|\bdaily\b|\b(by|per|each) (date|day)\b|\btrend\b/.test(text)) return "date";
   if (/\bmaterial[- ]?wise|\b(by|per) material\b|\bstyle[- ]?wise\b/.test(text)) return "material";
   if (/\bcurrency[- ]?wise|\b(by|per) currency\b/.test(text)) return "currency";
@@ -502,17 +597,23 @@ function outOfScope(text: string, lang: Lang): SalesAssistantReply | null {
   if (/\b(what|which) (did )?(other users?|others|someone else) ask/.test(text)) {
     return { message: say(lang, "I can't share other users' questions.", "Matha users kettadha share panna mudiyadhu.") };
   }
-  if (/\b(customer|client|buyer) (name|details?|address)\b|\bwho is the (customer|client|buyer)\b|\bmaterial description\b|\b(invoice|delivery) (no|number)\b|\bsales ?(org|organi[sz]ation)\b|\border type\b|\bcreated by\b|\bwho created\b/.test(text)) {
+  if (/\b(customer|client|buyer) (name|details?|address)\b|\bwho is the (customer|client|buyer)\b/.test(text)) {
+    return finish(
+      [say(lang, "Customer name is not available in the current Sales API response. I can provide Customer Group-wise analysis.", "Customer name Sales API la illa. Customer Group-wise analysis kaatalaam.")],
+      followUp(lang, "Want customer group-wise sales for this month?", "Indha maasam customer group-wise sales paakanuma?", "Customer group-wise sales this month"),
+    );
+  }
+  if (/\bmaterial description\b|\b(invoice|delivery) (no|number)\b|\bsales ?(org|organi[sz]ation)\b|\border type\b|\bcreated by\b|\bwho created\b/.test(text)) {
     return { message: notAvailable(lang) };
   }
-  if (/\bcustomers?\b|\bclients?\b|\bbuyers?\b|\boutstanding\b|\bpayments?\b|\breceivables?\b|\bdues?\b|\bcollections?\b/.test(text)) {
-    return {
-      message: say(
-        lang,
-        "Customer-wise data is not in the Sales data yet. Give me an order number or material and I'll check.",
-        "Customer-wise data Sales data la ippo illa. Order number or material sonnaa naan paakkaren.",
-      ),
-    };
+  if (/\bcustomers?\b(?![- ]?groups?)|\bclients?\b|\bbuyers?\b/.test(text)) {
+    return finish(
+      [say(lang, "Customer name is not available in the current Sales API response. I can provide Customer Group-wise analysis.", "Customer name Sales API la illa. Customer Group-wise analysis kaatalaam.")],
+      followUp(lang, "Want customer group-wise sales for this month?", "Indha maasam customer group-wise sales paakanuma?", "Customer group-wise sales this month"),
+    );
+  }
+  if (/\boutstanding\b|\bpayments?\b|\breceivables?\b|\bdues?\b|\bcollections?\b/.test(text)) {
+    return { message: say(lang, "Payment and outstanding details are not available in the current Sales API response.", "Payment / outstanding details Sales API la illa.") };
   }
   if (/\b(stock|inventory|warehouse)\b/.test(text)) {
     return { message: say(lang, "Stock information is not in the Sales module. For now I can help only with Sales data.", "Stock information Sales module la illa. Ippodhaiku Sales data pathi mattum help panna mudiyum.") };
@@ -732,7 +833,8 @@ async function summaryAnswer(period: Period, defaulted: boolean, text: string, f
   const wantsFoc = wantsFocText(text);
   const wantsTag = /\b(tag|header|parent) (rows?|items?)\b/.test(text);
   const wantsLatest = /\b(latest|last|recent|newest|kadaisi) (sales )?order\b/.test(text);
-  const grouped = groupBy && groupBy !== "currency" ? groupBy : null;
+  const multiMonth = period.from.slice(0, 7) !== period.to.slice(0, 7);
+  const grouped = groupBy && groupBy !== "currency" ? groupBy : multiMonth && !groupBy ? "month" : null;
   const data = await getSalesSummary({ date_from: period.from, date_to: period.to, group_by: grouped ?? "currency", filters });
   const lead = defaulted ? `Showing data for ${displayDate(period.from)}. ` : "";
   const scope = filterText(filters);
@@ -769,7 +871,7 @@ async function summaryAnswer(period: Period, defaulted: boolean, text: string, f
     );
   }
 
-  const notes = [...data.data_notes, ...data.warnings];
+  const notes = [...data.data_notes, ...data.warnings].filter((note) => !(filters.returns && /return item\(s\) are included/.test(note)));
   if (data.foc.items) notes.unshift(`${plural(data.foc.items, "FOC item")} excluded from sales value.`);
   if (wantsTag || data.tag_rows_excluded) notes.push(`${plural(data.tag_rows_excluded, "parent (TAG) row")} excluded from totals.`);
   const focOnly = data.foc_only_order_count ? ` (+${plural(data.foc_only_order_count, "FOC-only order")})` : "";
@@ -782,8 +884,9 @@ async function summaryAnswer(period: Period, defaulted: boolean, text: string, f
       : `${lead}${period.label}${scope}: ${plural(data.order_count, "order")}${focOnly}, ${plural(data.item_count, "sales item")}, ${qty(data.total_quantity)} units.`;
 
   if (grouped && data.groups) {
-    const label = { plant: "Plant", material: "Material", material_group: "Material Group", item_category: "Item Category", route: "Route", shipping_point: "Shipping Point", date: "Date", hour: "Hour", none: "", currency: "" }[grouped];
-    const shown = data.groups.slice(0, 10);
+    const label = GROUP_LABEL[grouped];
+    const limit = grouped === "month" ? 50 : 10;
+    const shown = data.groups.slice(0, limit);
     const rows = shown.map((group) => {
       const key = String(group[grouped]);
       const keyCell = grouped === "material" || grouped === "material_group" ? code(key) : key;
@@ -795,7 +898,8 @@ async function summaryAnswer(period: Period, defaulted: boolean, text: string, f
       [
         headline,
         table(headers, rows),
-        (data.group_count ?? 0) > 10 ? say(lang, `Showing top 10 of ${data.group_count}. I can filter by plant, material or date.`, `Showing top 10 of ${data.group_count}. Plant, material or date vachu filter pannalama?`) : null,
+        grouped === "month" && valueText ? `Total net: ${valueText}.` : null,
+        (data.group_count ?? 0) > limit ? say(lang, `Showing top ${limit} of ${data.group_count}. I can filter by plant, material or date.`, `Showing top ${limit} of ${data.group_count}. Plant, material or date vachu filter pannalama?`) : null,
         notesLine(notes),
         basis,
       ],
@@ -879,7 +983,21 @@ async function statusAnswer(status: StatusType, period: Period, defaulted: boole
 }
 
 async function topAnswer(text: string, period: Period, defaulted: boolean, filters: SalesFilters, lang: Lang): Promise<SalesAssistantReply> {
-  const dimension: Dimension = /\bmaterial[- ]?groups?\b/.test(text) ? "material_group" : /\bplants?\b/.test(text) ? "plant" : /\broutes?\b/.test(text) ? "route" : /\borders?\b/.test(text) && !/\bby orders?\b|\bmost orders\b/.test(text) ? "order" : "material";
+  const dimension: Dimension = /\bmaterial[- ]?groups?\b/.test(text)
+    ? "material_group"
+    : /\bcustomer[- ]?groups?\b/.test(text)
+      ? "customer_group"
+      : /\b(sales[- ]?)?districts?\b/.test(text)
+        ? "sales_district"
+        : /\bdivisions?\b/.test(text)
+          ? "division"
+          : /\bplants?\b/.test(text)
+            ? "plant"
+            : /\broutes?\b/.test(text)
+              ? "route"
+              : /\borders?\b/.test(text) && !/\bby orders?\b|\bmost orders\b/.test(text)
+                ? "order"
+                : "material";
   const metric: Metric = /\b(qty|quantity|units|pieces|pcs|volume)\b/.test(text)
     ? "quantity"
     : /\bcost\b/.test(text)
@@ -892,13 +1010,22 @@ async function topAnswer(text: string, period: Period, defaulted: boolean, filte
   const n = Math.min(10, explicitN ? Number(explicitN) : perCurrency ? 3 : 10);
   const data = await topN({ metric, dimension, date_from: period.from, date_to: period.to, n, filters: { ...filters, include_foc: /\bfoc\b/.test(text) } });
   const lead = defaulted ? `Showing data for ${displayDate(period.from)}. ` : "";
-  const dimName = { material: "materials", material_group: "material groups", plant: "plants", route: "routes", order: "orders" }[dimension];
+  const dimName = {
+    material: "materials",
+    material_group: "material groups",
+    plant: "plants",
+    route: "routes",
+    division: "divisions",
+    sales_district: "sales districts",
+    customer_group: "customer groups",
+    order: "orders",
+  }[dimension];
   const metricName = { quantity: "quantity", net_amount: "net amount", cost_amount: "cost", order_count: "order count" }[metric];
   if (!data.rows.length) return { message: `${lead}${say(lang, `No records found for ${period.label}${filterText(filters)}. Try another date or order number?`, `No records found for ${period.label}${filterText(filters)}. Vera date or order number try pannalaama?`)}` };
-  const label = { material: "Material", material_group: "Material Group", plant: "Plant", route: "Route", order: "Order" }[dimension];
+  const label = dimension === "order" ? "Order" : GROUP_LABEL[dimension];
   const cell = (row: Record<string, unknown>) => {
     const value = String(row[dimension]);
-    return dimension === "plant" || dimension === "route" ? value : code(value);
+    return dimension === "material" || dimension === "material_group" || dimension === "order" ? code(value) : value;
   };
   let headers: string[];
   let rows: string[][];
@@ -932,32 +1059,69 @@ async function topAnswer(text: string, period: Period, defaulted: boolean, filte
   );
 }
 
+/** Short column name: "Last month", "July 2026", "25-Sep-2026" or "01-Sep-2026 to 10-Sep-2026". */
+function periodName(period: Period): string {
+  if (period.kind === "keyword") return period.label.replace(/\s*\(.*\)$/, "");
+  if (period.kind === "day") return displayDate(period.from);
+  return `${displayDate(period.from)} to ${displayDate(period.to)}`;
+}
+
+function periodSpan(period: Period): string {
+  return period.from === period.to ? displayDate(period.from) : `${displayDate(period.from)} to ${displayDate(period.to)}`;
+}
+
 async function compareAnswer(x: Period, y: Period, filters: SalesFilters, lang: Lang): Promise<SalesAssistantReply> {
-  const [a, b] = x.from >= y.from ? [x, y] : [y, x];
+  const [current, previous] = x.from >= y.from ? [x, y] : [y, x];
   const data = await comparePeriods({
-    period_a: { date_from: a.from, date_to: a.to, label: a.label },
-    period_b: { date_from: b.from, date_to: b.to, label: b.label },
+    period_a: { date_from: current.from, date_to: current.to, label: current.label },
+    period_b: { date_from: previous.from, date_to: previous.to, label: previous.label },
     filters,
   });
-  const short = (period: Period) => period.label.replace(/^On /, "");
+  const cur = periodName(current);
+  const prev = periodName(previous);
+  const scope = filterText(filters);
   const t = data.totals;
   if (t.item_count.a === 0 && t.item_count.b === 0) {
-    return { message: say(lang, `No sales records found for ${short(a)} or ${short(b)}${filterText(filters)}. Try another date?`, `No records found for ${short(a)} and ${short(b)}${filterText(filters)}. Vera date try pannalaama?`) };
+    return { message: say(lang, `No sales records found for ${cur} or ${prev}${scope}. Try another date?`, `No records found for ${cur} and ${prev}${scope}. Vera date try pannalaama?`) };
   }
-  const pct = (value: number | null) => (value === null ? "—" : `${value > 0 ? "+" : ""}${value}%`);
+
+  type Change = { a: number; b: number; difference: number; change_pct: number | null };
+  const signed = (value: number, format: (n: number) => string) => (value === 0 ? format(0) : `${value > 0 ? "+" : "-"}${format(Math.abs(value))}`);
+  const pct = (change: Change) => (change.change_pct === null ? "N/A" : `${change.change_pct > 0 ? "+" : ""}${change.change_pct}%`);
+  const row = (label: string, change: Change, format: (n: number) => string) => [label, format(change.b), format(change.a), signed(change.difference, format), pct(change)];
+  const showCost = canSeeCost();
+
   const rows: string[][] = [
-    ["Orders", qty(t.order_count.a), qty(t.order_count.b), pct(t.order_count.change_pct)],
-    ["Sales items", qty(t.item_count.a), qty(t.item_count.b), pct(t.item_count.change_pct)],
-    ["Quantity", qty(t.total_quantity.a), qty(t.total_quantity.b), pct(t.total_quantity.change_pct)],
-    ...data.by_currency.map((row) => [`Net sales ${row.currency}`, amt(row.net_amount.a), amt(row.net_amount.b), pct(row.net_amount.change_pct)]),
+    row("Sales orders", t.order_count, qty),
+    row("Items", t.item_count, qty),
+    row("Quantity", t.total_quantity, qty),
+    ...(t.confirmed_quantity.a || t.confirmed_quantity.b ? [row("Confirmed delivery qty", t.confirmed_quantity, qty)] : []),
+    ...(t.return_items.a || t.return_items.b ? [row("Return items", t.return_items, qty)] : []),
+    ...data.by_currency.flatMap((entry) => [
+      row(`Net amount ${entry.currency}`, entry.net_amount, amt),
+      row(`Tax amount ${entry.currency}`, entry.tax_amount, amt),
+      ...(showCost ? [row(`Cost amount ${entry.currency}`, entry.cost_amount, amt)] : []),
+    ]),
   ];
-  const diff = t.total_quantity.difference;
-  const lead = diff === 0 ? `${short(a)} and ${short(b)} have the same quantity${filterText(filters)}.` : `${short(a)} is ${diff > 0 ? "up" : "down"} ${qty(Math.abs(diff))} units vs ${short(b)}${filterText(filters)}.`;
+
+  const movement = (name: string, change: Change, unit = "") =>
+    change.difference === 0 ? `${name} unchanged` : `${name} ${change.difference > 0 ? "up" : "down"} ${qty(Math.abs(change.difference))}${unit}${change.change_pct === null ? "" : ` (${pct(change)})`}`;
+  const lead = `${cur} vs ${prev}${scope}: ${movement("sales orders", t.order_count)}, ${movement("quantity", t.total_quantity, " units")}.`;
+
   const notes: string[] = [...data.warnings];
   if (t.foc_items.a || t.foc_items.b) notes.unshift("FOC items excluded from sales value.");
+  if (data.by_currency.length > 1) notes.push("Amounts are shown per currency and never added across currencies.");
+  if (rows.some((entry) => entry[4] === "N/A")) notes.push("N/A = the previous period value is zero, so % change is not calculated.");
+  if (t.return_items.a || t.return_items.b) notes.push("Return items are included in the totals.");
+
   return finish(
-    [lead, table(["Metric", short(a), short(b), "Change"], rows), notesLine(notes), `Based on items created in both periods. Data as of ${data.data_as_of}.`],
-    followUp(lang, `Want a plant-wise split for ${short(a)}?`, `${short(a)} plant-wise split paakanuma?`, `Plant-wise sales ${a.query}${filterQuery(filters)}`),
+    [
+      lead,
+      table(["Metric", prev, cur, "Difference", "% Change"], rows),
+      notesLine(notes),
+      `Based on items created: ${prev} = ${periodSpan(previous)}; ${cur} = ${periodSpan(current)}. Data as of ${data.data_as_of}.`,
+    ],
+    followUp(lang, `Want a plant-wise split for ${cur}?`, `${cur} plant-wise split paakanuma?`, `Plant-wise sales ${current.query}${filterQuery(filters)}`),
   );
 }
 
@@ -988,15 +1152,16 @@ function lastAssistantFollowUp(history: SalesAssistantTurn[]): string | null {
 
 const REFINE_CUE = /\b(adhula|athula|adhil|idhula|ithula|in that|of that|from that|same|only|mattum|just|what about|how about)\b/;
 const REFINE_FILLER =
-  /\b(adhula|athula|adhil|idhula|ithula|in|that|of|from|same|only|mattum|just|what|how|about|and|sales?|evlo|evvalavu|show|kaatu|kaattu|sollu|podu|please|pls|plant|currency|for|the|material|style|group|route|foc|free|items?)\b/g;
+  /\b(adhula|athula|adhil|idhula|ithula|in|that|of|from|same|only|mattum|just|what|how|about|and|sales?|evlo|evvalavu|show|kaatu|kaattu|sollu|podu|please|pls|plant|currency|for|the|material|style|group|route|foc|free|items?|customer|division|district)\b/g;
 
 function stripFilterTokens(text: string): string {
-  return text.replace(PLANT_RE, " ").replace(CURRENCY_RE, " ").replace(GROUP_RE, " ").replace(ROUTE_RE, " ").replace(CATEGORY_RE, " ").replace(EXPLICIT_MATERIAL_RE, " ");
+  return stripCodeFilters(text).replace(PLANT_RE, " ").replace(CURRENCY_RE, " ").replace(GROUP_RE, " ").replace(ROUTE_RE, " ").replace(CATEGORY_RE, " ").replace(EXPLICIT_MATERIAL_RE, " ").replace(RETURNS_RE, " ");
 }
 
 function isRefinement(message: string, today: string): boolean {
   const text = message.toLowerCase().trim();
-  const { found, masked } = findPeriods(text, today);
+  const { found, masked: rawMasked } = findPeriods(text, today);
+  const masked = stripCodeFilters(rawMasked);
   if (found.length || /\d{3,10}/.test(masked.replace(/\b(p\d{3}|mc\d{6}|z\d{5})\b/g, "")) && orderFrom(masked)) return false;
   const filters = filtersFrom(message, masked);
   if (!Object.keys(filters).length && !wantsFocText(text)) return false;
@@ -1013,6 +1178,9 @@ function withoutConflicts(base: string, filters: SalesFilters): string {
   if (filters.material_group) text = text.replace(GROUP_RE, " ");
   if (filters.route) text = text.replace(ROUTE_RE, " ");
   if (filters.item_category) text = text.replace(CATEGORY_RE, " ");
+  if (filters.customer_group) text = text.replace(CUSTOMER_GROUP_RE, " ");
+  if (filters.division) text = text.replace(DIVISION_RE, " ");
+  if (filters.sales_district) text = text.replace(DISTRICT_RE, " ");
   if (filters.material) {
     text = text.replace(EXPLICIT_MATERIAL_RE, " ");
     const token = materialToken(text.toLowerCase());
@@ -1074,7 +1242,7 @@ export function salesHelpReply(message: string): SalesAssistantReply {
 // Router ----------------------------------------------------------------------
 
 const SALES_WORDS =
-  /\b(sales?|sold|orders?|items?|quantity|qty|units|pieces|pcs|value|amount|revenue|net|tax|cost|margin|profit|foc|evlo|evvalavu|total|summary|business|turnover|vithanai|vitpanai|materials?|styles?|articles?|sku|plants?|deliver(y|ed)?|billing|billed|blocked?|incomplete|pending|dispatch|top|highest|compare|vs|latest|anuppala|anuppitanga|free|samples?)\b/;
+  /\b(sales?|sold|orders?|items?|quantity|qty|units|pieces|pcs|value|amount|revenue|net|tax|cost|margin|profit|foc|evlo|evvalavu|total|summary|business|turnover|vithanai|vitpanai|materials?|styles?|articles?|sku|plants?|deliver(y|ed)?|billing|billed|blocked?|incomplete|pending|dispatch|top|highest|compare|vs|latest|anuppala|anuppitanga|free|samples?|returns?|divisions?|district|customer group)\b/;
 
 async function answerWithRules(message: string, history: SalesAssistantTurn[], now: Date, depth = 0): Promise<SalesAssistantReply | null> {
   const text = message.toLowerCase().replace(/\s+/g, " ").trim();
@@ -1104,7 +1272,7 @@ async function answerWithRules(message: string, history: SalesAssistantTurn[], n
   }
 
   const { found, masked, unclear } = findPeriods(text, today);
-  const cleaned = masked.replace(/\btop\s*\d{1,2}\b/g, " ");
+  const cleaned = stripCodeFilters(masked).replace(/\btop\s*\d{1,2}\b/g, " ");
   const viewMode = wantsFocText(text) && viewModeFrom(text) === "count" ? null : viewModeFrom(text);
   const wantsCost = wantsCostText(text);
   if (wantsCost && !canSeeCost()) {
@@ -1175,7 +1343,7 @@ async function answerWithRules(message: string, history: SalesAssistantTurn[], n
 }
 
 function toolErrorMessage(error: ToolInputError, lang: Lang): string {
-  if (error.code === "range_too_large") return say(lang, error.message, "31 days ku mela range edukka mudiyadhu. Konjam narrow pannunga (e.g. indha maasam or last 30 days).");
+  if (error.code === "range_too_large") return say(lang, error.message, "6 maasathukku mela range edukka mudiyadhu. Konjam narrow pannunga (e.g. last 3 months or indha maasam).");
   if (error.code === "plant_access") return say(lang, error.message, `Indha plant data ungalukku access illa. Allowed: ${allowedPlantsText()}.`);
   if (error.code === "cost_access") return costDenied(lang);
   return error.message;
